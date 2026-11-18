@@ -447,6 +447,16 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
           requiredTrait,
           requester)
 
+      case groupRefreshJoin: StreamPhysicalGroupRefreshDeltaJoin =>
+        // recomputing groups replaces rows, so it produces all kinds of changes
+        val children = visitChildren(groupRefreshJoin, ModifyKindSetTrait.ALL_CHANGES)
+        createNewNode(
+          groupRefreshJoin,
+          children,
+          ModifyKindSetTrait.ALL_CHANGES,
+          requiredTrait,
+          requester)
+
       case multiJoin: StreamPhysicalMultiJoin =>
         // multi-join supports all changes in input
         val children = visitChildren(multiJoin, ModifyKindSetTrait.ALL_CHANGES)
@@ -970,6 +980,28 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
               UpdateKindTrait.fromChangelogMode,
               UpdateKindTrait.NONE)
             createNewNode(rel, Some(children), providedUpdateTrait)
+          }
+
+        case groupRefreshJoin: StreamPhysicalGroupRefreshDeltaJoin =>
+          // inputs whose rows can leave their anchors in an update must provide old images; the
+          // others are asked for UPDATE_AFTER only, and give UPDATE_BEFORE if they cannot
+          val children = groupRefreshJoin.getInputs.zipWithIndex.map {
+            case (child, ordinal) =>
+              val physicalChild = child.asInstanceOf[StreamPhysicalRel]
+              val inputModifyKindSet = getModifyKindSet(physicalChild)
+              if (groupRefreshJoin.needsOldImages(ordinal)) {
+                this.visit(physicalChild, beforeAfterOrNone(inputModifyKindSet))
+              } else {
+                this
+                  .visit(physicalChild, onlyAfterOrNone(inputModifyKindSet))
+                  .orElse(this.visit(physicalChild, beforeAfterOrNone(inputModifyKindSet)))
+              }
+          }
+          if (children.exists(_.isEmpty)) {
+            None
+          } else {
+            // the operator can produce whatever the consumer requires, see the output modes
+            createNewNode(groupRefreshJoin, Some(children.flatten.toList), requiredUpdateTrait)
           }
 
         case multiJoin: StreamPhysicalMultiJoin =>
@@ -1597,6 +1629,26 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
 
         case _: StreamPhysicalIntermediateTableScan =>
           createNewNode(rel, Some(List()), fullDeleteOrNone(getModifyKindSet(rel)))
+
+        case groupRefreshJoin: StreamPhysicalGroupRefreshDeltaJoin =>
+          val children = groupRefreshJoin.getInputs.zipWithIndex.map {
+            case (child, ordinal) =>
+              val physicalChild = child.asInstanceOf[StreamPhysicalRel]
+              val inputModifyKindSet = getModifyKindSet(physicalChild)
+              if (groupRefreshJoin.needsOldImages(ordinal)) {
+                this.visit(physicalChild, fullDeleteOrNone(inputModifyKindSet))
+              } else {
+                this
+                  .visit(physicalChild, deleteOnKeyOrNone(inputModifyKindSet))
+                  .orElse(this.visit(physicalChild, fullDeleteOrNone(inputModifyKindSet)))
+              }
+          }
+          if (children.exists(_.isEmpty)) {
+            None
+          } else {
+            // the operator keeps the emitted rows when the consumer requires full deletes
+            createNewNode(groupRefreshJoin, Some(children.flatten.toList), requiredTrait)
+          }
 
         case multiJoin: StreamPhysicalMultiJoin =>
           val children = multiJoin.getInputs.zipWithIndex.map {

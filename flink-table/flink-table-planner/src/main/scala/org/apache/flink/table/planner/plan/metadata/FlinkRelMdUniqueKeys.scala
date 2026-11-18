@@ -117,6 +117,11 @@ class FlinkRelMdUniqueKeys private extends MetadataHandler[BuiltInMetadata.Uniqu
   }
 
   def getUniqueKeys(
+      rel: StreamPhysicalGroupRefreshDeltaJoin,
+      mq: RelMetadataQuery,
+      ignoreNulls: Boolean): JSet[ImmutableBitSet] = rel.getOutputUniqueKeys
+
+  def getUniqueKeys(
       rel: StreamPhysicalMiniBatchAssigner,
       mq: RelMetadataQuery,
       ignoreNulls: Boolean): JSet[ImmutableBitSet] = {

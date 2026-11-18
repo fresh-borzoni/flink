@@ -68,6 +68,7 @@ import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecExpand;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecGlobalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecGlobalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecGroupAggregate;
+import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecGroupRefreshDeltaJoin;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecGroupTableAggregate;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecGroupWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecIncrementalGroupAggregate;
@@ -189,6 +190,7 @@ public final class ExecNodeMetadataUtil {
                     add(StreamExecPythonOverAggregate.class);
                     add(StreamExecMLPredictTableFunction.class);
                     add(StreamExecDeltaJoin.class);
+                    add(StreamExecGroupRefreshDeltaJoin.class);
                     add(StreamExecVectorSearchTableFunction.class);
                     // Batch execution mode
                     add(BatchExecSink.class);

@@ -324,6 +324,14 @@ object FlinkStreamProgram {
             .build(),
           "watermark transpose"
         )
+        .addProgram(
+          FlinkHepRuleSetProgramBuilder.newBuilder
+            .setHepRulesExecutionType(HEP_RULES_EXECUTION_TYPE.RULE_COLLECTION)
+            .setHepMatchOrder(HepMatchOrder.TOP_DOWN)
+            .add(FlinkStreamRuleSets.GROUP_REFRESH_DELTA_JOIN_RULES)
+            .build(),
+          "group refresh delta join"
+        )
         .addProgram(new FlinkChangelogModeInferenceProgram, "Changelog mode inference")
         .addProgram(
           new FlinkMiniBatchIntervalTraitInitProgram,

@@ -564,6 +564,15 @@ object FlinkStreamRuleSets {
     DuplicateChangesInferRule.INSTANCE
   )
 
+  /**
+   * RuleSet that converts joins into delta joins that refresh groups, and lets them read their
+   * output back, before changelog inference.
+   */
+  val GROUP_REFRESH_DELTA_JOIN_RULES: RuleSet = RuleSets.ofList(
+    GroupRefreshDeltaJoinRule.INSTANCE,
+    DeltaJoinReadBackRule.INSTANCE
+  )
+
   /** RuleSet to optimize plans after stream exec execution. */
   val PHYSICAL_REWRITE: RuleSet = RuleSets.ofList(
     // optimize agg rule

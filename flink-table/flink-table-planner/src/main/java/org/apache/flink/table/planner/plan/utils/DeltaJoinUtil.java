@@ -26,6 +26,7 @@ import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.LookupTableSource;
+import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.functions.AsyncTableFunction;
 import org.apache.flink.table.functions.UserDefinedFunction;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
@@ -235,6 +236,18 @@ public class DeltaJoinUtil {
      */
     public static AsyncTableFunction<?> getUnwrappedAsyncLookupFunction(
             RelOptTable temporalTable, Collection<Integer> lookupKeys, ClassLoader classLoader) {
+        return getUnwrappedAsyncLookupFunction(temporalTable, lookupKeys, classLoader, false);
+    }
+
+    /**
+     * Like {@link #getUnwrappedAsyncLookupFunction(RelOptTable, Collection, ClassLoader)}, for
+     * lookups that may have to read the writes of a sink in their task.
+     */
+    public static AsyncTableFunction<?> getUnwrappedAsyncLookupFunction(
+            RelOptTable temporalTable,
+            Collection<Integer> lookupKeys,
+            ClassLoader classLoader,
+            boolean requiresReadYourWrites) {
         UserDefinedFunction lookupFunction =
                 LookupJoinUtil.getLookupFunction(
                         temporalTable,
@@ -242,7 +255,8 @@ public class DeltaJoinUtil {
                         classLoader,
                         true, // async
                         null, // retryStrategy
-                        false); // applyCustomShuffle
+                        false, // applyCustomShuffle
+                        requiresReadYourWrites);
 
         boolean changed = true;
         while (changed) {
@@ -1009,7 +1023,7 @@ public class DeltaJoinUtil {
         return Tuple2.of(left.toArray(new IntPair[0]), right.toArray(new IntPair[0]));
     }
 
-    private static boolean isTableScanSupported(TableScan tableScan, int[] lookupKeys) {
+    public static boolean isTableScanSupported(TableScan tableScan, int[] lookupKeys) {
         // legacy source and data stream source are not supported yet
         if (!(tableScan instanceof StreamPhysicalTableSourceScan)) {
             return false;
@@ -1099,7 +1113,12 @@ public class DeltaJoinUtil {
             return false;
         }
 
-        ChangelogMode changelogMode = getChangelogMode((StreamPhysicalRel) tableScan);
+        // before the changelog mode is inferred (group refresh delta join) the scan has no
+        // changelog trait yet; then it produces the changelog mode of its source
+        ChangelogMode changelogMode =
+                JavaScalaConversionUtil.toJava(
+                                ChangelogPlanUtils.getChangelogMode((StreamPhysicalRel) tableScan))
+                        .orElseGet(() -> declaredChangelogMode(tableScan));
         if (changelogMode.containsOnly(RowKind.INSERT)) {
             return true;
         }
@@ -1109,6 +1128,15 @@ public class DeltaJoinUtil {
         Set<ImmutableBitSet> upsertKeys = fmq.getUpsertKeys(tableScan);
         return filtersOnSource.stream()
                 .allMatch(filter -> isFilterOnOneSetOfUpsertKeys(filter, upsertKeys));
+    }
+
+    /** The changelog mode that the source of a scan declares. */
+    public static ChangelogMode declaredChangelogMode(TableScan tableScan) {
+        DynamicTableSource source =
+                ((StreamPhysicalTableSourceScan) tableScan).tableSourceTable().tableSource();
+        return source instanceof ScanTableSource
+                ? ((ScanTableSource) source).getChangelogMode()
+                : ChangelogMode.insertOnly();
     }
 
     public static StreamPhysicalTableSourceScan getTableScan(RelNode node) {
@@ -1181,7 +1209,7 @@ public class DeltaJoinUtil {
         return isLeftSupported && isRightSupported;
     }
 
-    private static boolean isCalcOnTableScanSupported(RelNode joinInput) {
+    public static boolean isCalcOnTableScanSupported(RelNode joinInput) {
         return isCalcSupported(() -> collectCalcBetweenJoinAndTableScan(joinInput));
     }
 
@@ -1332,7 +1360,7 @@ public class DeltaJoinUtil {
                                                 node)));
     }
 
-    private static StreamPhysicalRel unwrapNode(RelNode node, boolean transposeToChildBlock) {
+    public static StreamPhysicalRel unwrapNode(RelNode node, boolean transposeToChildBlock) {
         if (node instanceof HepRelVertex) {
             node = ((HepRelVertex) node).getCurrentRel();
         }

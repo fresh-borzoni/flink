@@ -1,0 +1,309 @@
+<?xml version="1.0" ?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to you under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<Root>
+  <TestCase name="testAnchorKeyIsReadWhenTheQueryDoesNotUseIt">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO name_amount_log SELECT c.name, o.amount FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.name_amount_log], fields=[name, amount])
++- LogicalProject(name=[$7], amount=[$4])
+   +- LogicalJoin(condition=[=($1, $5)], joinType=[left])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.name_amount_log], fields=[name, amount], changelogMode=[NONE])
++- Calc(select=[name, amount], changelogMode=[I,UB,UA,D])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 LeftOuterJoin #1], joinConditions=[=(customer_id, customer_id)], groups=[anchor #0(order_id)], mode=[STATE], select=[customer_id, amount, customer_id0, name], changelogMode=[I,UB,UA,D])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[customer_id, amount, order_id]]], fields=[customer_id, amount, order_id], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, customers, project=[customer_id, name]]], fields=[customer_id, name], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testChainLeftJoin">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_region_sink SELECT o.order_id, c.name, r.region FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id LEFT JOIN regions r ON c.region_id = r.region_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_region_sink], fields=[order_id, name, region])
++- LogicalProject(order_id=[$0], name=[$7], region=[$9])
+   +- LogicalJoin(condition=[=($6, $8)], joinType=[left])
+      :- LogicalJoin(condition=[=($1, $5)], joinType=[left])
+      :  :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      :  +- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, regions]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_region_sink], fields=[order_id, name, region], changelogMode=[NONE])
++- Calc(select=[order_id, name, region], changelogMode=[I,UA,PD])
+   +- GroupRefreshDeltaJoin(joinTree=[(#0 LeftOuterJoin #1) LeftOuterJoin #2], joinConditions=[=(customer_id, customer_id); =(region_id, region_id)], groups=[anchor #0(order_id)], mode=[UPSERT], select=[order_id, region_id, name, region_id0, region], changelogMode=[I,UA,PD])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id]]], fields=[order_id, customer_id], changelogMode=[I,UB,UA,D])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, customers]], fields=[customer_id, region_id, name], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, regions]], fields=[region_id, region], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testFilterBetweenJoins">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_region_sink SELECT order_id, name, region FROM ( SELECT o.order_id, o.customer_id, c.name, c.region_id FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id WHERE c.name IS NULL OR c.name <> 'x') t LEFT JOIN regions r ON t.region_id = r.region_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_region_sink], fields=[order_id, name, region])
++- LogicalProject(order_id=[$0], name=[$2], region=[$5])
+   +- LogicalJoin(condition=[=($3, $4)], joinType=[left])
+      :- LogicalProject(order_id=[$0], customer_id=[$1], name=[$7], region_id=[$6])
+      :  +- LogicalFilter(condition=[OR(IS NULL($7), <>($7, _UTF-16LE'x'))])
+      :     +- LogicalJoin(condition=[=($1, $5)], joinType=[left])
+      :        :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      :        +- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, regions]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_region_sink], fields=[order_id, name, region], changelogMode=[NONE])
++- Calc(select=[order_id, name, region], changelogMode=[I,UA,PD])
+   +- GroupRefreshDeltaJoin(joinTree=[(#0 LeftOuterJoin #1) LeftOuterJoin #2], joinConditions=[=(customer_id, customer_id); =(region_id, region_id)], filtersBetweenJoins=[SEARCH(name, Sarg[(-∞.._UTF-16LE'x':VARCHAR(2147483647) CHARACTER SET "UTF-16LE"), (_UTF-16LE'x':VARCHAR(2147483647) CHARACTER SET "UTF-16LE"..+∞); NULL AS TRUE]:VARCHAR(2147483647) CHARACTER SET "UTF-16LE")], groups=[anchor #0(order_id)], mode=[UPSERT], select=[order_id, name, region_id, region_id0, region], changelogMode=[I,UA,PD])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id]]], fields=[order_id, customer_id], changelogMode=[I,UB,UA,D])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, customers]], fields=[customer_id, region_id, name], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, regions]], fields=[region_id, region], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testFilterOnNonKeyColumnRequestsBeforeImages">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_sink_by_key SELECT o.order_id, c.name, CAST(NULL AS STRING) FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id WHERE o.amount > 10]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_sink_by_key], fields=[order_id, name, EXPR$2])
++- LogicalProject(order_id=[$0], name=[$7], EXPR$2=[null:VARCHAR(2147483647) CHARACTER SET "UTF-16LE"])
+   +- LogicalFilter(condition=[>($4, 10)])
+      +- LogicalJoin(condition=[=($1, $5)], joinType=[left])
+         :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+         +- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_sink_by_key], fields=[order_id, name, EXPR$2], changelogMode=[NONE])
++- Calc(select=[order_id, name, null:VARCHAR(2147483647) AS EXPR$2], changelogMode=[I,UA,PD])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 LeftOuterJoin #1], joinConditions=[=(customer_id, customer_id)], groups=[anchor #0(order_id)], mode=[UPSERT], select=[order_id, customer_id, customer_id0, name], changelogMode=[I,UA,PD])
+      :- Calc(select=[order_id, customer_id], where=[>(amount, 10)], changelogMode=[I,UB,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, filter=[], project=[order_id, customer_id, amount]]], fields=[order_id, customer_id, amount], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, customers, project=[customer_id, name]]], fields=[customer_id, name], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testManyToManyJoinWithDeletes">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_shipment_sink SELECT o.order_id, s.shipment_id FROM orders o JOIN shipments s ON o.country = s.country]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_shipment_sink], fields=[order_id, shipment_id])
++- LogicalProject(order_id=[$0], shipment_id=[$5])
+   +- LogicalJoin(condition=[=($3, $6)], joinType=[inner])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, shipments]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_shipment_sink], fields=[order_id, shipment_id], changelogMode=[NONE])
++- Calc(select=[order_id, shipment_id], changelogMode=[I,UA,PD])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 InnerJoin #1], joinConditions=[=(country, country)], groups=[anchor #0(order_id)], mode=[STATE], select=[order_id, country, shipment_id, country0], changelogMode=[I,UA,PD])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, country]]], fields=[order_id, country], changelogMode=[I,UB,UA,D])
+      +- TableSourceScan(table=[[default_catalog, default_database, shipments]], fields=[shipment_id, country], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testOneToManyInnerJoinAnchorsOnChild">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO item_sink SELECT i.item_id, o.order_id FROM orders o JOIN items i ON o.order_id = i.order_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.item_sink], fields=[item_id, order_id])
++- LogicalProject(item_id=[$5], order_id=[$0])
+   +- LogicalJoin(condition=[=($0, $6)], joinType=[inner])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, items]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.item_sink], fields=[item_id, order_id], changelogMode=[NONE])
++- Calc(select=[item_id, order_id], changelogMode=[I,UA,PD])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 InnerJoin #1], joinConditions=[=(order_id, order_id)], groups=[anchor #1(item_id)], mode=[UPSERT], select=[order_id, item_id, order_id0], changelogMode=[I,UA,PD])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id]]], fields=[order_id], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, items, project=[item_id, order_id]]], fields=[item_id, order_id], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testOneToManyLeftJoinKeepsGroups">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_item_log SELECT o.order_id, i.item_id, i.qty FROM orders o LEFT JOIN items i ON o.order_id = i.order_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_item_log], fields=[order_id, item_id, qty])
++- LogicalProject(order_id=[$0], item_id=[$5], qty=[$7])
+   +- LogicalJoin(condition=[=($0, $6)], joinType=[left])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, items]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_item_log], fields=[order_id, item_id, qty], changelogMode=[NONE])
++- Calc(select=[order_id, item_id, qty], changelogMode=[I,UB,UA,D])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 LeftOuterJoin #1], joinConditions=[=(order_id, order_id)], groups=[anchor #0(order_id)], mode=[STATE], select=[order_id, item_id, order_id0, qty], changelogMode=[I,UB,UA,D])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id]]], fields=[order_id], changelogMode=[I,UB,UA,D])
+      +- TableSourceScan(table=[[default_catalog, default_database, items]], fields=[item_id, order_id, qty], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testRightJoinAnchorsOnRightSide">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_item_log SELECT o.order_id, i.item_id, i.qty FROM items i RIGHT JOIN orders o ON o.order_id = i.order_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_item_log], fields=[order_id, item_id, qty])
++- LogicalProject(order_id=[$3], item_id=[$0], qty=[$2])
+   +- LogicalJoin(condition=[=($3, $1)], joinType=[right])
+      :- LogicalTableScan(table=[[default_catalog, default_database, items]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_item_log], fields=[order_id, item_id, qty], changelogMode=[NONE])
++- Calc(select=[order_id0 AS order_id, item_id, qty], changelogMode=[I,UB,UA,D])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 RightOuterJoin #1], joinConditions=[=(order_id, order_id)], groups=[anchor #1(order_id)], mode=[STATE], select=[item_id, order_id, qty, order_id0], changelogMode=[I,UB,UA,D])
+      :- TableSourceScan(table=[[default_catalog, default_database, items]], fields=[item_id, order_id, qty], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id]]], fields=[order_id], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testStarLeftJoinKeepsGroupsForFullDeleteSink">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_sink SELECT o.order_id, c.name, p.product FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id LEFT JOIN products p ON o.product_id = p.product_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_sink], fields=[order_id, name, product])
++- LogicalProject(order_id=[$0], name=[$7], product=[$9])
+   +- LogicalJoin(condition=[=($2, $8)], joinType=[left])
+      :- LogicalJoin(condition=[=($1, $5)], joinType=[left])
+      :  :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      :  +- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, products]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_sink], fields=[order_id, name, product], changelogMode=[NONE])
++- Calc(select=[order_id, name, product], changelogMode=[I,UA,D])
+   +- GroupRefreshDeltaJoin(joinTree=[(#0 LeftOuterJoin #1) LeftOuterJoin #2], joinConditions=[=(customer_id, customer_id); =(product_id, product_id)], groups=[anchor #0(order_id)], mode=[STATE], select=[order_id, product_id, name, product_id0, product], changelogMode=[I,UA,D])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id, product_id]]], fields=[order_id, customer_id, product_id], changelogMode=[I,UB,UA,D])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, customers, project=[customer_id, name]]], fields=[customer_id, name], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, products]], fields=[product_id, product], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testStarLeftJoinUpsertsByFactKey">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_sink_by_key SELECT o.order_id, c.name, p.product FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id LEFT JOIN products p ON o.product_id = p.product_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_sink_by_key], fields=[order_id, name, product])
++- LogicalProject(order_id=[$0], name=[$7], product=[$9])
+   +- LogicalJoin(condition=[=($2, $8)], joinType=[left])
+      :- LogicalJoin(condition=[=($1, $5)], joinType=[left])
+      :  :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      :  +- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, products]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_sink_by_key], fields=[order_id, name, product], changelogMode=[NONE])
++- Calc(select=[order_id, name, product], changelogMode=[I,UA,PD])
+   +- GroupRefreshDeltaJoin(joinTree=[(#0 LeftOuterJoin #1) LeftOuterJoin #2], joinConditions=[=(customer_id, customer_id); =(product_id, product_id)], groups=[anchor #0(order_id)], mode=[UPSERT], select=[order_id, product_id, name, product_id0, product], changelogMode=[I,UA,PD])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id, product_id]]], fields=[order_id, customer_id, product_id], changelogMode=[I,UB,UA,D])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, customers, project=[customer_id, name]]], fields=[customer_id, name], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, products]], fields=[product_id, product], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testUpsertSourceWithoutOldImagesNeeded">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_sink_by_key SELECT o.order_id, c.name, CAST(NULL AS STRING) FROM orders o LEFT JOIN customers_upsert c ON o.customer_id = c.customer_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_sink_by_key], fields=[order_id, name, EXPR$2])
++- LogicalProject(order_id=[$0], name=[$7], EXPR$2=[null:VARCHAR(2147483647) CHARACTER SET "UTF-16LE"])
+   +- LogicalJoin(condition=[=($1, $5)], joinType=[left])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, customers_upsert]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_sink_by_key], fields=[order_id, name, EXPR$2], changelogMode=[NONE])
++- Calc(select=[order_id, name, null:VARCHAR(2147483647) AS EXPR$2], changelogMode=[I,UA,PD])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 LeftOuterJoin #1], joinConditions=[=(customer_id, customer_id)], groups=[anchor #0(order_id)], mode=[UPSERT], select=[order_id, customer_id, customer_id0, name], changelogMode=[I,UA,PD])
+      :- DropUpdateBefore(changelogMode=[I,UA,D])
+      :  +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id]]], fields=[order_id, customer_id], changelogMode=[I,UB,UA,D])
+      +- TableSourceScan(table=[[default_catalog, default_database, customers_upsert, project=[customer_id, name]]], fields=[customer_id, name], changelogMode=[I,UA,PD])
+]]>
+    </Resource>
+  </TestCase>
+</Root>

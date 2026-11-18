@@ -1,0 +1,443 @@
+{
+  "flinkVersion" : "",
+  "nodes" : [ {
+    "id" : 1,
+    "type" : "stream-exec-table-source-scan_2",
+    "scanTableSource" : {
+      "table" : {
+        "identifier" : "`default_catalog`.`default_database`.`customers`",
+        "resolvedTable" : {
+          "schema" : {
+            "columns" : [ {
+              "name" : "customer_id",
+              "dataType" : "INT NOT NULL"
+            }, {
+              "name" : "name",
+              "dataType" : "VARCHAR(2147483647)"
+            } ],
+            "primaryKey" : {
+              "name" : "PK_customer_id",
+              "type" : "PRIMARY_KEY",
+              "columns" : [ "customer_id" ]
+            },
+            "indexes" : [ {
+              "name" : "INDEX_customer_id",
+              "columns" : [ "customer_id" ]
+            } ]
+          },
+          "options" : {
+            "async" : "true",
+            "bounded" : "false",
+            "changelog-mode" : "I,UB,UA,D",
+            "connector" : "values"
+          }
+        }
+      }
+    },
+    "outputType" : "ROW<`customer_id` INT NOT NULL, `name` VARCHAR(2147483647)>",
+    "description" : "TableSourceScan(table=[[default_catalog, default_database, customers]], fields=[customer_id, name])"
+  }, {
+    "id" : 2,
+    "type" : "stream-exec-drop-update-before_1",
+    "inputProperties" : [ {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    } ],
+    "outputType" : "ROW<`customer_id` INT NOT NULL, `name` VARCHAR(2147483647)>",
+    "description" : "DropUpdateBefore"
+  }, {
+    "id" : 3,
+    "type" : "stream-exec-table-source-scan_2",
+    "scanTableSource" : {
+      "table" : {
+        "identifier" : "`default_catalog`.`default_database`.`orders`",
+        "resolvedTable" : {
+          "schema" : {
+            "columns" : [ {
+              "name" : "order_id",
+              "dataType" : "INT NOT NULL"
+            }, {
+              "name" : "customer_id",
+              "dataType" : "INT"
+            }, {
+              "name" : "country",
+              "dataType" : "VARCHAR(2147483647)"
+            }, {
+              "name" : "amount",
+              "dataType" : "INT"
+            } ],
+            "primaryKey" : {
+              "name" : "PK_order_id",
+              "type" : "PRIMARY_KEY",
+              "columns" : [ "order_id" ]
+            },
+            "indexes" : [ {
+              "name" : "INDEX_order_id",
+              "columns" : [ "order_id" ]
+            }, {
+              "name" : "INDEX_customer_id",
+              "columns" : [ "customer_id" ]
+            }, {
+              "name" : "INDEX_country",
+              "columns" : [ "country" ]
+            } ]
+          },
+          "options" : {
+            "async" : "true",
+            "bounded" : "false",
+            "changelog-mode" : "I,UB,UA,D",
+            "connector" : "values"
+          }
+        }
+      },
+      "abilities" : [ {
+        "type" : "ProjectPushDown",
+        "projectedFields" : [ [ 0 ], [ 1 ], [ 3 ] ],
+        "producedType" : "ROW<`order_id` INT NOT NULL, `customer_id` INT, `amount` INT> NOT NULL"
+      } ]
+    },
+    "outputType" : "ROW<`order_id` INT NOT NULL, `customer_id` INT, `amount` INT>",
+    "description" : "TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id, amount]]], fields=[order_id, customer_id, amount])"
+  }, {
+    "id" : 4,
+    "type" : "stream-exec-group-refresh-delta-join_1",
+    "configuration" : {
+      "table.exec.async-lookup.buffer-capacity" : "100",
+      "table.exec.async-lookup.timeout" : "3 min",
+      "table.exec.delta-join.cache-enabled" : "true",
+      "table.exec.delta-join.group-refresh.max-group-size" : "1000000",
+      "table.exec.delta-join.group-refresh.output-cache-size" : "10000",
+      "table.exec.delta-join.group-refresh.page-size" : "10000",
+      "table.exec.delta-join.left.cache-size" : "10000",
+      "table.exec.delta-join.right.cache-size" : "10000"
+    },
+    "spec" : {
+      "leafTypes" : [ "ROW<`customer_id` INT NOT NULL, `name` VARCHAR(2147483647)>", "ROW<`order_id` INT NOT NULL, `customer_id` INT, `amount` INT>" ],
+      "nodes" : [ {
+        "leaf" : 0,
+        "left" : -1,
+        "right" : -1,
+        "edge" : -1,
+        "outputLeaves" : [ 0, 0 ],
+        "outputFields" : [ 0, 1 ]
+      }, {
+        "leaf" : 1,
+        "left" : -1,
+        "right" : -1,
+        "edge" : -1,
+        "outputLeaves" : [ 1, 1, 1 ],
+        "outputFields" : [ 0, 1, 2 ]
+      }, {
+        "leaf" : -1,
+        "left" : 0,
+        "right" : 1,
+        "joinType" : "INNER",
+        "edge" : 0,
+        "condition" : {
+          "kind" : "CALL",
+          "syntax" : "BINARY",
+          "internalName" : "$=$1",
+          "operands" : [ {
+            "kind" : "INPUT_REF",
+            "inputIndex" : 0,
+            "type" : "INT NOT NULL"
+          }, {
+            "kind" : "INPUT_REF",
+            "inputIndex" : 3,
+            "type" : "INT"
+          } ],
+          "type" : "BOOLEAN"
+        },
+        "leftType" : "ROW<`customer_id` INT NOT NULL, `name` VARCHAR(2147483647)>",
+        "rightType" : "ROW<`order_id` INT NOT NULL, `customer_id` INT, `amount` INT>",
+        "outputLeaves" : [ 0, 0, 1, 1, 1 ],
+        "outputFields" : [ 0, 1, 0, 1, 2 ]
+      } ],
+      "edges" : [ {
+        "leftLeaf" : 0,
+        "leftFields" : [ 0 ],
+        "rightLeaf" : 1,
+        "rightFields" : [ 1 ],
+        "lookupRight" : {
+          "lookupTable" : {
+            "lookupTableSource" : {
+              "table" : {
+                "identifier" : "`default_catalog`.`default_database`.`orders`",
+                "resolvedTable" : {
+                  "schema" : {
+                    "columns" : [ {
+                      "name" : "order_id",
+                      "dataType" : "INT NOT NULL"
+                    }, {
+                      "name" : "customer_id",
+                      "dataType" : "INT"
+                    }, {
+                      "name" : "country",
+                      "dataType" : "VARCHAR(2147483647)"
+                    }, {
+                      "name" : "amount",
+                      "dataType" : "INT"
+                    } ],
+                    "primaryKey" : {
+                      "name" : "PK_order_id",
+                      "type" : "PRIMARY_KEY",
+                      "columns" : [ "order_id" ]
+                    },
+                    "indexes" : [ {
+                      "name" : "INDEX_order_id",
+                      "columns" : [ "order_id" ]
+                    }, {
+                      "name" : "INDEX_customer_id",
+                      "columns" : [ "customer_id" ]
+                    }, {
+                      "name" : "INDEX_country",
+                      "columns" : [ "country" ]
+                    } ]
+                  },
+                  "options" : {
+                    "async" : "true",
+                    "bounded" : "false",
+                    "changelog-mode" : "I,UB,UA,D",
+                    "connector" : "values"
+                  }
+                }
+              },
+              "abilities" : [ {
+                "type" : "ProjectPushDown",
+                "projectedFields" : [ [ 0 ], [ 1 ], [ 3 ] ],
+                "producedType" : "ROW<`order_id` INT NOT NULL, `customer_id` INT, `amount` INT> NOT NULL"
+              } ]
+            },
+            "outputType" : "ROW<`order_id` INT NOT NULL, `customer_id` INT, `amount` INT> NOT NULL"
+          },
+          "lookupKeys" : {
+            "1" : {
+              "type" : "FieldRef",
+              "index" : 0
+            }
+          },
+          "remainingCondition" : null
+        },
+        "lookupLeft" : {
+          "lookupTable" : {
+            "lookupTableSource" : {
+              "table" : {
+                "identifier" : "`default_catalog`.`default_database`.`customers`",
+                "resolvedTable" : {
+                  "schema" : {
+                    "columns" : [ {
+                      "name" : "customer_id",
+                      "dataType" : "INT NOT NULL"
+                    }, {
+                      "name" : "name",
+                      "dataType" : "VARCHAR(2147483647)"
+                    } ],
+                    "primaryKey" : {
+                      "name" : "PK_customer_id",
+                      "type" : "PRIMARY_KEY",
+                      "columns" : [ "customer_id" ]
+                    },
+                    "indexes" : [ {
+                      "name" : "INDEX_customer_id",
+                      "columns" : [ "customer_id" ]
+                    } ]
+                  },
+                  "options" : {
+                    "async" : "true",
+                    "bounded" : "false",
+                    "changelog-mode" : "I,UB,UA,D",
+                    "connector" : "values"
+                  }
+                }
+              }
+            },
+            "outputType" : "ROW<`customer_id` INT NOT NULL, `name` VARCHAR(2147483647)> NOT NULL"
+          },
+          "lookupKeys" : {
+            "0" : {
+              "type" : "FieldRef",
+              "index" : 1
+            }
+          },
+          "remainingCondition" : null
+        }
+      } ],
+      "anchorLeaf" : -1,
+      "anchorKey" : [ ],
+      "leafKeys" : [ [ 0 ], [ 0 ] ],
+      "grouping" : "JOIN_KEY"
+    },
+    "outputMode" : "READ_BACK",
+    "declaredKeys" : [ ],
+    "inputProperties" : [ {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    }, {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    } ],
+    "outputType" : "ROW<`customer_id` INT NOT NULL, `order_id` INT NOT NULL, `name` VARCHAR(2147483647), `amount` INT>",
+    "description" : "GroupRefreshDeltaJoin(joinTree=[#0 InnerJoin #1], joinConditions=[=(customer_id, customer_id)], groups=[join key], mode=[READ_BACK], readBack=[default_catalog.default_database.customer_orders], readableAfter=[write], projection=[customer_id, order_id, name, amount], select=[customer_id, order_id, name, amount])",
+    "readBack" : {
+      "projectionInput" : "ROW<`customer_id` INT NOT NULL, `name` VARCHAR(2147483647), `order_id` INT NOT NULL, `customer_id0` INT, `amount` INT>",
+      "projection" : [ {
+        "kind" : "INPUT_REF",
+        "inputIndex" : 0,
+        "type" : "INT NOT NULL"
+      }, {
+        "kind" : "INPUT_REF",
+        "inputIndex" : 2,
+        "type" : "INT NOT NULL"
+      }, {
+        "kind" : "INPUT_REF",
+        "inputIndex" : 1,
+        "type" : "VARCHAR(2147483647)"
+      }, {
+        "kind" : "INPUT_REF",
+        "inputIndex" : 4,
+        "type" : "INT"
+      } ],
+      "outputTable" : {
+        "lookupTableSource" : {
+          "table" : {
+            "identifier" : "`default_catalog`.`default_database`.`customer_orders`",
+            "resolvedTable" : {
+              "schema" : {
+                "columns" : [ {
+                  "name" : "customer_id",
+                  "dataType" : "INT NOT NULL"
+                }, {
+                  "name" : "order_id",
+                  "dataType" : "INT NOT NULL"
+                }, {
+                  "name" : "name",
+                  "dataType" : "VARCHAR(2147483647)"
+                }, {
+                  "name" : "amount",
+                  "dataType" : "INT"
+                } ],
+                "primaryKey" : {
+                  "name" : "PK_customer_id_order_id",
+                  "type" : "PRIMARY_KEY",
+                  "columns" : [ "customer_id", "order_id" ]
+                },
+                "indexes" : [ {
+                  "name" : "INDEX_customer_id",
+                  "columns" : [ "customer_id" ]
+                } ]
+              },
+              "options" : {
+                "connector" : "shared-store",
+                "sink.read-your-writes" : "true",
+                "store" : "plan-test"
+              }
+            }
+          }
+        },
+        "outputType" : "ROW<`customer_id` INT NOT NULL, `order_id` INT NOT NULL, `name` VARCHAR(2147483647), `amount` INT> NOT NULL"
+      },
+      "groupColumns" : [ 0 ],
+      "outputKey" : [ 0, 1 ],
+      "readYourWrites" : true
+    },
+    "dropUpdateBefore" : true
+  }, {
+    "id" : 5,
+    "type" : "stream-exec-sink_2",
+    "configuration" : {
+      "table.exec.sink.keyed-shuffle" : "AUTO",
+      "table.exec.sink.not-null-enforcer" : "ERROR",
+      "table.exec.sink.rowtime-inserter" : "ENABLED",
+      "table.exec.sink.type-length-enforcer" : "IGNORE",
+      "table.exec.sink.upsert-materialize" : "AUTO"
+    },
+    "dynamicTableSink" : {
+      "table" : {
+        "identifier" : "`default_catalog`.`default_database`.`customer_orders`",
+        "resolvedTable" : {
+          "schema" : {
+            "columns" : [ {
+              "name" : "customer_id",
+              "dataType" : "INT NOT NULL"
+            }, {
+              "name" : "order_id",
+              "dataType" : "INT NOT NULL"
+            }, {
+              "name" : "name",
+              "dataType" : "VARCHAR(2147483647)"
+            }, {
+              "name" : "amount",
+              "dataType" : "INT"
+            } ],
+            "primaryKey" : {
+              "name" : "PK_customer_id_order_id",
+              "type" : "PRIMARY_KEY",
+              "columns" : [ "customer_id", "order_id" ]
+            },
+            "indexes" : [ {
+              "name" : "INDEX_customer_id",
+              "columns" : [ "customer_id" ]
+            } ]
+          },
+          "options" : {
+            "connector" : "shared-store",
+            "sink.read-your-writes" : "true",
+            "store" : "plan-test"
+          }
+        }
+      },
+      "abilities" : [ {
+        "type" : "ReadYourWrites"
+      } ]
+    },
+    "inputChangelogMode" : [ "INSERT", "UPDATE_AFTER", "~DELETE" ],
+    "inputUpsertKey" : [ 0, 1 ],
+    "inputProperties" : [ {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    } ],
+    "outputType" : "ROW<`customer_id` INT NOT NULL, `order_id` INT NOT NULL, `name` VARCHAR(2147483647), `amount` INT>",
+    "description" : "Sink(table=[default_catalog.default_database.customer_orders], fields=[customer_id, order_id, name, amount])"
+  } ],
+  "edges" : [ {
+    "source" : 1,
+    "target" : 2,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  }, {
+    "source" : 2,
+    "target" : 4,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  }, {
+    "source" : 3,
+    "target" : 4,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  }, {
+    "source" : 4,
+    "target" : 5,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  } ]
+}

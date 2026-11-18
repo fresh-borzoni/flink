@@ -63,6 +63,18 @@ public abstract class FlinkHints {
      */
     public static final String HINT_NAME_JSON_AGGREGATE_WRAPPED = "JSON_AGGREGATE_WRAPPED";
 
+    /**
+     * Join hint that lets the delta joins of a query block refresh groups, also when the job does
+     * not enable it. It takes no options.
+     */
+    public static final String HINT_NAME_GROUP_REFRESH = "GROUP_REFRESH";
+
+    /** Whether the given hints contain the {@link #HINT_NAME_GROUP_REFRESH} hint. */
+    public static boolean hasGroupRefreshHint(List<RelHint> hints) {
+        return hints.stream()
+                .anyMatch(hint -> HINT_NAME_GROUP_REFRESH.equalsIgnoreCase(hint.hintName));
+    }
+
     // ~ Tools ------------------------------------------------------------------
 
     /**

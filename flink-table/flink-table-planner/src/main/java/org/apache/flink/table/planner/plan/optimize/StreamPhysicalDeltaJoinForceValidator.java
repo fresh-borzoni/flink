@@ -22,6 +22,7 @@ import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.OptimizerConfigOptions;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalDeltaJoin;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupRefreshDeltaJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalJoin;
 import org.apache.flink.table.planner.plan.utils.FlinkRelOptUtil;
 
@@ -92,7 +93,8 @@ public class StreamPhysicalDeltaJoinForceValidator {
         public void visit(RelNode node, int ordinal, @Nullable RelNode parent) {
             if (node instanceof StreamPhysicalJoin) {
                 regularJoinExists = true;
-            } else if (node instanceof StreamPhysicalDeltaJoin) {
+            } else if (node instanceof StreamPhysicalDeltaJoin
+                    || node instanceof StreamPhysicalGroupRefreshDeltaJoin) {
                 deltaJoinExists = true;
             }
             super.visit(node, ordinal, parent);

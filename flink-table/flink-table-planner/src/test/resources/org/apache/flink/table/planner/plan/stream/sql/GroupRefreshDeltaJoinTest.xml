@@ -1,0 +1,133 @@
+<?xml version="1.0" ?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to you under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<Root>
+  <TestCase name="testFullJoinRefreshesJoinKeyGroups">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_shipments SELECT COALESCE(o.country, s.country), o.order_id, s.shipment_id FROM orders o FULL JOIN shipments s ON o.country = s.country]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_shipments], fields=[EXPR$0, order_id, shipment_id])
++- LogicalProject(EXPR$0=[COALESCE($2, $5)], order_id=[$0], shipment_id=[$4])
+   +- LogicalJoin(condition=[=($2, $5)], joinType=[full])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, shipments]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_shipments], fields=[EXPR$0, order_id, shipment_id], changelogMode=[NONE])
++- Calc(select=[COALESCE(country, country0) AS EXPR$0, order_id, shipment_id], changelogMode=[I,UB,UA,D])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 FullOuterJoin #1], joinConditions=[=(country, country)], groups=[join key], mode=[STATE], select=[order_id, country, shipment_id, country0], changelogMode=[I,UB,UA,D])
+      :- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, country]]], fields=[order_id, country], changelogMode=[I,UB,UA,D])
+      +- TableSourceScan(table=[[default_catalog, default_database, shipments]], fields=[shipment_id, country], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testJoinOnKeysOfUpsertSources">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_items SELECT i.order_id, i.item_id, o.amount, i.qty FROM items_upsert i LEFT JOIN orders_upsert o ON i.order_id = o.order_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_items], fields=[order_id, item_id, amount, qty])
++- LogicalProject(order_id=[$0], item_id=[$1], amount=[$4], qty=[$2])
+   +- LogicalJoin(condition=[=($0, $3)], joinType=[left])
+      :- LogicalTableScan(table=[[default_catalog, default_database, items_upsert]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, orders_upsert]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_items], fields=[order_id, item_id, amount, qty], changelogMode=[NONE])
++- GroupRefreshDeltaJoin(joinTree=[#0 LeftOuterJoin #1], joinConditions=[=(order_id, order_id)], groups=[join key], mode=[READ_BACK], readBack=[default_catalog.default_database.order_items], readableAfter=[write], projection=[order_id, item_id, amount, qty], select=[order_id, item_id, amount, qty], changelogMode=[I,UA,PD])
+   :- TableSourceScan(table=[[default_catalog, default_database, items_upsert]], fields=[order_id, item_id, qty], changelogMode=[I,UA,PD])
+   +- TableSourceScan(table=[[default_catalog, default_database, orders_upsert]], fields=[order_id, amount], changelogMode=[I,UA,PD])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testLeftJoinRefreshesJoinKeyGroups">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO order_customers SELECT o.order_id, o.customer_id, c.name FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.order_customers], fields=[order_id, customer_id, name])
++- LogicalProject(order_id=[$0], customer_id=[$1], name=[$5])
+   +- LogicalJoin(condition=[=($1, $4)], joinType=[left])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.order_customers], fields=[order_id, customer_id, name], changelogMode=[NONE])
++- Calc(select=[order_id, customer_id, name], changelogMode=[I,UB,UA,D])
+   +- GroupRefreshDeltaJoin(joinTree=[#0 LeftOuterJoin #1], joinConditions=[=(customer_id, customer_id)], groups=[join key], mode=[STATE], select=[order_id, customer_id, customer_id0, name], changelogMode=[I,UB,UA,D])
+      :- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id]]], fields=[order_id, customer_id], changelogMode=[I,UB,UA,D])
+      +- DropUpdateBefore(changelogMode=[I,UA,D])
+         +- TableSourceScan(table=[[default_catalog, default_database, customers]], fields=[customer_id, name], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testReadBackFromOutputTable">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO customer_orders SELECT c.customer_id, o.order_id, c.name, o.amount FROM customers c JOIN orders o ON c.customer_id = o.customer_id]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.customer_orders], fields=[customer_id, order_id, name, amount])
++- LogicalProject(customer_id=[$0], order_id=[$2], name=[$1], amount=[$5])
+   +- LogicalJoin(condition=[=($0, $3)], joinType=[inner])
+      :- LogicalTableScan(table=[[default_catalog, default_database, customers]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.customer_orders], fields=[customer_id, order_id, name, amount], changelogMode=[NONE])
++- GroupRefreshDeltaJoin(joinTree=[#0 InnerJoin #1], joinConditions=[=(customer_id, customer_id)], groups=[join key], mode=[READ_BACK], readBack=[default_catalog.default_database.customer_orders], readableAfter=[write], projection=[customer_id, order_id, name, amount], select=[customer_id, order_id, name, amount], changelogMode=[I,UA,PD])
+   :- DropUpdateBefore(changelogMode=[I,UA,D])
+   :  +- TableSourceScan(table=[[default_catalog, default_database, customers]], fields=[customer_id, name], changelogMode=[I,UB,UA,D])
+   +- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, customer_id, amount]]], fields=[order_id, customer_id, amount], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testReadBackOfFullJoinWithConstantsForNulls">
+    <Resource name="sql">
+      <![CDATA[INSERT INTO country_shipments SELECT COALESCE(o.country, s.country, '?'), COALESCE(o.order_id, -1), COALESCE(s.shipment_id, -1), o.amount FROM orders o FULL JOIN shipments s ON o.country = s.country]]>
+    </Resource>
+    <Resource name="ast">
+      <![CDATA[
+LogicalSink(table=[default_catalog.default_database.country_shipments], fields=[EXPR$0, EXPR$1, EXPR$2, amount])
++- LogicalProject(EXPR$0=[COALESCE($2, $5, _UTF-16LE'?')], EXPR$1=[COALESCE($0, -1)], EXPR$2=[COALESCE($4, -1)], amount=[$3])
+   +- LogicalJoin(condition=[=($2, $5)], joinType=[full])
+      :- LogicalTableScan(table=[[default_catalog, default_database, orders]])
+      +- LogicalTableScan(table=[[default_catalog, default_database, shipments]])
+]]>
+    </Resource>
+    <Resource name="optimized rel plan">
+      <![CDATA[
+Sink(table=[default_catalog.default_database.country_shipments], fields=[EXPR$0, EXPR$1, EXPR$2, amount], changelogMode=[NONE])
++- GroupRefreshDeltaJoin(joinTree=[#0 FullOuterJoin #1], joinConditions=[=(country, country)], groups=[join key], mode=[READ_BACK], readBack=[default_catalog.default_database.country_shipments], readableAfter=[write], projection=[COALESCE(country, country0, _UTF-16LE'?'), COALESCE(order_id, -1), COALESCE(shipment_id, -1), amount], select=[EXPR$0, EXPR$1, EXPR$2, amount], changelogMode=[I,UA,PD])
+   :- TableSourceScan(table=[[default_catalog, default_database, orders, project=[order_id, country, amount]]], fields=[order_id, country, amount], changelogMode=[I,UB,UA,D])
+   +- TableSourceScan(table=[[default_catalog, default_database, shipments]], fields=[shipment_id, country], changelogMode=[I,UB,UA,D])
+]]>
+    </Resource>
+  </TestCase>
+</Root>

@@ -40,6 +40,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalD
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExpand;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupAggregateBase;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupRefreshDeltaJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLateralSnapshotJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLegacySink;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLegacyTableSourceScan;
@@ -206,6 +207,10 @@ public class StreamNonDeterministicUpdatePlanVisitor {
                     (StreamPhysicalWindowTableFunction) rel, requireDeterminism);
         } else if (rel instanceof StreamPhysicalDeltaJoin) {
             return visitDeltaJoin((StreamPhysicalDeltaJoin) rel, requireDeterminism);
+        } else if (rel instanceof StreamPhysicalGroupRefreshDeltaJoin) {
+            // the output rows are built from lookups and from the changed rows of the inputs,
+            // which come straight from the sources
+            return transmitDeterminismRequirement(rel, NO_REQUIRED_DETERMINISM);
         } else if (rel instanceof StreamPhysicalMLPredictTableFunction) {
             return visitMLPredictTableFunction(
                     (StreamPhysicalMLPredictTableFunction) rel, requireDeterminism);

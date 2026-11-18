@@ -133,6 +133,11 @@ public abstract class FlinkHintStrategies {
                                 .optionChecker(NON_EMPTY_LIST_OPTION_CHECKER)
                                 .build())
                 .hintStrategy(
+                        FlinkHints.HINT_NAME_GROUP_REFRESH,
+                        HintStrategy.builder(HintPredicates.JOIN)
+                                .optionChecker(NO_OPTION_CHECKER)
+                                .build())
+                .hintStrategy(
                         StateTtlHint.STATE_TTL.getHintName(),
                         HintStrategy.builder(
                                         HintPredicates.or(
@@ -160,6 +165,13 @@ public abstract class FlinkHintStrategies {
     }
 
     // ~ hint option checker ------------------------------------------------------------
+
+    private static final HintOptionChecker NO_OPTION_CHECKER =
+            (hint, litmus) ->
+                    litmus.check(
+                            hint.listOptions.isEmpty() && hint.kvOptions.isEmpty(),
+                            "Hint {} takes no options.",
+                            hint.hintName);
 
     private static final HintOptionChecker NON_EMPTY_LIST_OPTION_CHECKER =
             (hint, errorHandler) ->

@@ -321,6 +321,10 @@ class FlinkRelMdUpsertKeys private extends MetadataHandler[UpsertKeys] {
     )
   }
 
+  def getUpsertKeys(
+      groupRefreshJoin: StreamPhysicalGroupRefreshDeltaJoin,
+      mq: RelMetadataQuery): JSet[ImmutableBitSet] = groupRefreshJoin.getOutputUpsertKeys
+
   /*
    * * This method calculates the upsert keys for a multi-way join by
    * progressively applying the two-way join logic from FlinkRelMdUniqueKeys.
