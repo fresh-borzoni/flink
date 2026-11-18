@@ -132,6 +132,10 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
     public static final ConfigOption<Boolean> SINK_READ_YOUR_WRITES =
             ConfigOptions.key("sink.read-your-writes").booleanType().defaultValue(true);
 
+    /** Whether the sink needs the whole old row of a delete, as some key-value stores do. */
+    public static final ConfigOption<Boolean> SINK_FULL_DELETES =
+            ConfigOptions.key("sink.full-deletes").booleanType().defaultValue(false);
+
     // the writers that let the lookups of their task read what they wrote, by the store and table
     // they write; a task runs its writer and its lookups in one thread
     private static final ThreadLocal<Map<String, List<SinkWriter<?>>>> READ_YOUR_WRITES =
@@ -361,6 +365,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         options.add(INSERT_ONLY);
         options.add(SINK_BUFFER_UNTIL_FLUSH);
         options.add(SINK_READ_YOUR_WRITES);
+        options.add(SINK_FULL_DELETES);
         return options;
     }
 
@@ -414,7 +419,8 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                 primaryKey,
                 types,
                 helper.getOptions().get(SINK_BUFFER_UNTIL_FLUSH),
-                helper.getOptions().get(SINK_READ_YOUR_WRITES));
+                helper.getOptions().get(SINK_READ_YOUR_WRITES),
+                helper.getOptions().get(SINK_FULL_DELETES));
     }
 
     /**
@@ -432,6 +438,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         private final LogicalType[] types;
         private final boolean bufferUntilFlush;
         private final boolean offersReadYourWrites;
+        private final boolean fullDeletes;
         private boolean readYourWrites;
 
         private StoreTableSink(
@@ -440,13 +447,15 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                 int[] primaryKey,
                 LogicalType[] types,
                 boolean bufferUntilFlush,
-                boolean offersReadYourWrites) {
+                boolean offersReadYourWrites,
+                boolean fullDeletes) {
             this.store = store;
             this.table = table;
             this.primaryKey = primaryKey;
             this.types = types;
             this.bufferUntilFlush = bufferUntilFlush;
             this.offersReadYourWrites = offersReadYourWrites;
+            this.fullDeletes = fullDeletes;
         }
 
         @Override
@@ -457,7 +466,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
 
         @Override
         public ChangelogMode getChangelogMode(ChangelogMode requestedMode) {
-            return ChangelogMode.upsert(true);
+            return ChangelogMode.upsert(!fullDeletes);
         }
 
         @Override
@@ -476,7 +485,8 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                             primaryKey,
                             types,
                             bufferUntilFlush,
-                            offersReadYourWrites);
+                            offersReadYourWrites,
+                            fullDeletes);
             copy.readYourWrites = readYourWrites;
             return copy;
         }

@@ -30,6 +30,7 @@ import org.apache.flink.table.catalog.ContextResolvedTable;
 import org.apache.flink.table.catalog.Index;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.catalog.UniqueConstraint;
+import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.ParallelismProvider;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.sink.abilities.SupportsReadBackAfterCheckpoint;
@@ -49,6 +50,7 @@ import org.apache.flink.table.runtime.operators.join.FlinkJoinType;
 import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.AnchorJoinTree.FieldMap;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.types.RowKind;
 
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelRule;
@@ -266,9 +268,8 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
         }
 
         private @Nullable String analyze(RexProgram program, StreamPhysicalSink sink) {
-            if (tree.grouping == GroupRefreshDeltaJoinSpec.Grouping.ANCHOR
-                    && tree.singleRowGroups) {
-                return "every group has at most one row, which needs no memory to replace";
+            if (takesUpsertsByAnchorKey(sink)) {
+                return "every group has at most one row, which the join upserts by its key";
             }
             if (sink.targetColumns() != null) {
                 return "the sink writes only some columns, so it reads back rows it did not write";
@@ -382,9 +383,28 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
          * that the join upserts by it.
          */
         private boolean keyedByGroups() {
-            if (readBack != null) {
-                return true;
+            return readBack != null || primaryKeyIsAnchorKey();
+        }
+
+        /**
+         * Whether the join can upsert by the anchor key instead of reading back: single-row groups
+         * keyed by it and a sink taking key deletes. Asked from the sink, before changelog inference.
+         */
+        private boolean takesUpsertsByAnchorKey(StreamPhysicalSink sink) {
+            if (!primaryKeyIsAnchorKey() || sink.conflictStrategy() != null) {
+                return false;
             }
+            ChangelogMode mode;
+            try {
+                mode = sink.tableSink().getChangelogMode(ChangelogMode.all());
+            } catch (Throwable t) {
+                return false;
+            }
+            return !mode.contains(RowKind.UPDATE_BEFORE) && mode.keyOnlyDeletes();
+        }
+
+        /** Every group has at most one row, and the primary key of the table is the anchor key. */
+        private boolean primaryKeyIsAnchorKey() {
             if (tree.grouping != GroupRefreshDeltaJoinSpec.Grouping.ANCHOR
                     || !tree.singleRowGroups
                     || tree.outputAnchorKeyPositions == null
@@ -478,8 +498,7 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
 
         /**
          * A unique key declared for the joined rows tells them apart, or the unique keys of all
-         * other tables do. A key field that the equality columns of the joins tie to the anchor key
-         * is the same in every row of a group that holds a row of its table, and needs no column.
+         * other tables do, see {@link #heldFields()}.
          */
         private @Nullable String anchorRowsApart() {
             int[] anchorPositions = tree.outputAnchorKeyPositions;
@@ -493,7 +512,7 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
                     return null;
                 }
             }
-            Set<List<Integer>> tied = fieldsTiedToAnchorKey();
+            Set<List<Integer>> held = heldFields();
             for (int leaf = 0; leaf < tree.numLeaves(); leaf++) {
                 if (leaf == tree.anchorLeaf) {
                     continue;
@@ -504,14 +523,49 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
                     return String.format("table #%s has no unique key", leaf);
                 }
                 for (int field : key.get()) {
-                    if (!tied.contains(Arrays.asList(leaf, field))
-                            && !keyHolds(positionOf(leaf, field))) {
+                    if (!held.contains(Arrays.asList(leaf, field))) {
                         return String.format(
                                 "the primary key does not hold the unique key of table #%s", leaf);
                     }
                 }
             }
             return null;
+        }
+
+        /**
+         * Key fields that need no column of their own: held by a primary key column, tied to the
+         * anchor key, or equal to such a field through an equi-join that drops their unmatched rows.
+         */
+        private Set<List<Integer>> heldFields() {
+            Set<List<Integer>> held = fieldsTiedToAnchorKey();
+            for (int i = 0; i < output.size(); i++) {
+                if (keyHolds(i)) {
+                    held.add(Arrays.asList(output.leafOf(i), output.fieldOf(i)));
+                }
+            }
+            boolean grown = true;
+            while (grown) {
+                grown = false;
+                for (GroupRefreshDeltaJoinUtil.PlannerNode node : tree.nodes) {
+                    if (node.isLeaf() || node.joinType == FlinkJoinType.FULL) {
+                        continue;
+                    }
+                    GroupRefreshDeltaJoinUtil.PlannerEdge edge = tree.edges.get(node.edge);
+                    boolean rightFollows = node.joinType != FlinkJoinType.RIGHT;
+                    boolean leftFollows = node.joinType != FlinkJoinType.LEFT;
+                    for (int i = 0; i < edge.leftFields.length; i++) {
+                        List<Integer> left = Arrays.asList(edge.leftLeaf, edge.leftFields[i]);
+                        List<Integer> right = Arrays.asList(edge.rightLeaf, edge.rightFields[i]);
+                        if (rightFollows && held.contains(left) && held.add(right)) {
+                            grown = true;
+                        }
+                        if (leftFollows && held.contains(right) && held.add(left)) {
+                            grown = true;
+                        }
+                    }
+                }
+            }
+            return held;
         }
 
         /** The (table, field) pairs that equality columns tie to the anchor key, transitively. */

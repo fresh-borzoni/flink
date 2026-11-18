@@ -47,6 +47,7 @@ public class AnchorLocateOperatorFactory extends AbstractStreamOperatorFactory<R
     private final AnchorNotes notes;
     private final int[] uniqueKey;
     private final boolean equalityJoin;
+    private final int pageSize;
 
     public AnchorLocateOperatorFactory(
             AnchorJoinTree tree,
@@ -57,7 +58,8 @@ public class AnchorLocateOperatorFactory extends AbstractStreamOperatorFactory<R
             int capacity,
             AnchorNotes notes,
             int[] uniqueKey,
-            boolean equalityJoin) {
+            boolean equalityJoin,
+            int pageSize) {
         this.tree = tree;
         this.lookupSpecs = lookupSpecs;
         this.leaf = leaf;
@@ -67,6 +69,7 @@ public class AnchorLocateOperatorFactory extends AbstractStreamOperatorFactory<R
         this.notes = notes;
         this.uniqueKey = uniqueKey;
         this.equalityJoin = equalityJoin;
+        this.pageSize = pageSize;
     }
 
     @Override
@@ -83,7 +86,8 @@ public class AnchorLocateOperatorFactory extends AbstractStreamOperatorFactory<R
                         capacity,
                         notes,
                         uniqueKey,
-                        equalityJoin);
+                        equalityJoin,
+                        pageSize);
         return (T) operator;
     }
 

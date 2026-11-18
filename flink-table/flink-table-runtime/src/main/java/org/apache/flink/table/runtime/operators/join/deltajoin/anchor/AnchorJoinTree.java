@@ -69,6 +69,12 @@ public final class AnchorJoinTree implements Serializable {
      */
     private final int[][] anchorKeyFieldsInNeighbour;
 
+    /** Per table, the fields holding the anchor key, see {@link #getAnchorKeyFieldsOf}. */
+    private final int[][] anchorKeyFieldsOf;
+
+    /** For every table, the lookup that returns its rows of a whole group, or -1. */
+    private final int[] groupLookups;
+
     public AnchorJoinTree(
             RowType[] leafTypes,
             Node[] nodes,
@@ -76,6 +82,21 @@ public final class AnchorJoinTree implements Serializable {
             int anchorLeaf,
             int[] anchorKeyFields,
             int anchorLookup) {
+        this(leafTypes, nodes, edges, anchorLeaf, anchorKeyFields, anchorLookup, null);
+    }
+
+    /**
+     * @param groupLookups per table, the lookup that returns the rows of the table of a whole group
+     *     for an anchor key row, or -1; null for none
+     */
+    public AnchorJoinTree(
+            RowType[] leafTypes,
+            Node[] nodes,
+            Edge[] edges,
+            int anchorLeaf,
+            int[] anchorKeyFields,
+            int anchorLookup,
+            @Nullable int[] groupLookups) {
         this.leafTypes = leafTypes;
         this.nodes = nodes;
         this.edges = edges;
@@ -87,6 +108,19 @@ public final class AnchorJoinTree implements Serializable {
         this.nextTowardsAnchor = new int[leafTypes.length];
         this.pathsToAnchor = computePathsToAnchor();
         this.anchorKeyFieldsInNeighbour = computeAnchorKeyFieldsInNeighbours();
+        this.anchorKeyFieldsOf = computeAnchorKeyFieldsOf();
+        if (groupLookups == null) {
+            groupLookups = new int[leafTypes.length];
+            Arrays.fill(groupLookups, -1);
+        }
+        Preconditions.checkArgument(groupLookups.length == leafTypes.length);
+        for (int leaf = 0; leaf < leafTypes.length; leaf++) {
+            Preconditions.checkArgument(
+                    groupLookups[leaf] < 0 || anchorKeyFieldsOf[leaf] != null,
+                    "Table %s is read by group, but its rows do not hold the anchor key.",
+                    leaf);
+        }
+        this.groupLookups = groupLookups;
     }
 
     public int getNumLeaves() {
@@ -128,35 +162,46 @@ public final class AnchorJoinTree implements Serializable {
     }
 
     /**
-     * The fields of rows of the table before the anchor table on the path from the given table
-     * whose values are the anchor key, or null. With them, locating anchors skips the last lookup
-     * of the path: it takes the anchor key from the row that would be the key of that lookup. It
-     * then also returns keys of anchor rows that do not exist, which only causes extra refreshes.
+     * The fields holding the anchor key in every line with a row of the table, or null. Beyond the
+     * anchor's neighbours, only through joins that drop unmatched rows of the table.
      */
-    public @Nullable int[] getAnchorKeyFieldsBeforeAnchor(int leaf) {
-        return leaf == anchorLeaf ? null : anchorKeyFieldsInNeighbour[getTableBeforeAnchor(leaf)];
+    public @Nullable int[] getAnchorKeyFieldsOf(int leaf) {
+        return anchorKeyFieldsOf[leaf];
     }
 
-    /** The last table before the anchor table on the path from the given other table. */
-    public int getTableBeforeAnchor(int leaf) {
-        Preconditions.checkArgument(leaf != anchorLeaf, "The anchor table has no path.");
-        int beforeAnchor = leaf;
-        while (nextTowardsAnchor[beforeAnchor] != anchorLeaf) {
-            beforeAnchor = nextTowardsAnchor[beforeAnchor];
+    /**
+     * The first table on the path to the anchor, from the table itself, whose rows hold the anchor
+     * key; -1 if none. Locating reads the key from it; keys of missing anchors only cost a refresh.
+     */
+    public int getLocateTable(int leaf) {
+        for (int current = leaf; current != anchorLeaf; current = nextTowardsAnchor[current]) {
+            if (anchorKeyFieldsOf[current] != null) {
+                return current;
+            }
         }
-        return beforeAnchor;
+        return -1;
     }
 
     /**
      * The lookups that locating anchors for rows of the given table calls, in order: the path to
-     * the anchor, without its last lookup if {@link #getAnchorKeyFieldsBeforeAnchor} gives the
-     * anchor key.
+     * the anchor, up to the table of {@link #getLocateTable}.
      */
     public int[] getLocateLookups(int leaf) {
         int[] path = pathsToAnchor[leaf];
-        return getAnchorKeyFieldsBeforeAnchor(leaf) == null
-                ? path
-                : Arrays.copyOf(path, path.length - 1);
+        int table = getLocateTable(leaf);
+        if (table < 0) {
+            return path;
+        }
+        int hops = 0;
+        for (int current = leaf; current != table; current = nextTowardsAnchor[current]) {
+            hops++;
+        }
+        return Arrays.copyOf(path, hops);
+    }
+
+    /** The lookup that returns the rows of the given table of a whole group, or -1. */
+    public int getGroupLookup(int leaf) {
+        return groupLookups[leaf];
     }
 
     /**
@@ -235,6 +280,11 @@ public final class AnchorJoinTree implements Serializable {
         for (Edge edge : edges) {
             used[towardsAnchor[edge.lookupRight] ? edge.lookupLeft : edge.lookupRight] = true;
         }
+        for (int lookup : groupLookups) {
+            if (lookup >= 0) {
+                used[lookup] = true;
+            }
+        }
         return used;
     }
 
@@ -296,19 +346,77 @@ public final class AnchorJoinTree implements Serializable {
         return result;
     }
 
+    private int[][] computeAnchorKeyFieldsOf() {
+        int numLeaves = leafTypes.length;
+        int[][] result = new int[numLeaves][];
+        Integer[] byDistance = new Integer[numLeaves];
+        for (int leaf = 0; leaf < numLeaves; leaf++) {
+            byDistance[leaf] = leaf;
+        }
+        // the table towards the anchor first
+        Arrays.sort(byDistance, (a, b) -> pathsToAnchor[a].length - pathsToAnchor[b].length);
+        for (int leaf : byDistance) {
+            int next = nextTowardsAnchor[leaf];
+            if (leaf == anchorLeaf) {
+                continue;
+            }
+            if (next == anchorLeaf) {
+                result[leaf] = anchorKeyFieldsInNeighbour[leaf];
+                continue;
+            }
+            if (result[next] == null || !keptOnlyWhereMatched(leaf)) {
+                continue;
+            }
+            Edge edge = edges[nodes[getJoinTowardsAnchor(leaf)].getEdge()];
+            boolean leafIsLeft = edge.leftLeaf == leaf;
+            result[leaf] =
+                    anchorKeyFieldsIn(
+                            leaf,
+                            leafIsLeft ? edge.leftFields : edge.rightFields,
+                            leafIsLeft ? edge.rightFields : edge.leftFields,
+                            result[next]);
+        }
+        return result;
+    }
+
+    /** Whether the join towards the anchor keeps rows of the table only where they matched. */
+    private boolean keptOnlyWhereMatched(int leaf) {
+        Node join = nodes[getJoinTowardsAnchor(leaf)];
+        boolean inLeft = nodes[join.getLeft()].containsLeaf(leaf);
+        switch (join.getJoinType()) {
+            case INNER:
+                return true;
+            case LEFT:
+                return !inLeft;
+            case RIGHT:
+                return inLeft;
+            default:
+                return false;
+        }
+    }
+
     /**
      * The fields of the neighbour equal to the anchor key fields, if the equality columns between
      * them cover the anchor key and the types agree; null otherwise.
      */
     private @Nullable int[] anchorKeyFieldsIn(
             int neighbour, int[] neighbourFields, int[] anchorFields) {
+        return anchorKeyFieldsIn(neighbour, neighbourFields, anchorFields, anchorKeyFields);
+    }
+
+    /**
+     * The fields of a table equal to the anchor key fields of the next table towards the anchor,
+     * or null if the equality columns do not cover them or the types differ.
+     */
+    private @Nullable int[] anchorKeyFieldsIn(
+            int neighbour, int[] neighbourFields, int[] anchorFields, int[] keyFieldsOfNext) {
         RowType anchorType = leafTypes[anchorLeaf];
         RowType neighbourType = leafTypes[neighbour];
         int[] fields = new int[anchorKeyFields.length];
         for (int k = 0; k < anchorKeyFields.length; k++) {
             int found = -1;
             for (int i = 0; i < anchorFields.length && found < 0; i++) {
-                if (anchorFields[i] == anchorKeyFields[k]) {
+                if (anchorFields[i] == keyFieldsOfNext[k]) {
                     found = neighbourFields[i];
                 }
             }

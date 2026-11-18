@@ -82,6 +82,8 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
     // write into an upsert sink in the store, which is not rolled back on a restore
     private boolean sinkInStore;
     private @Nullable String expectedMode;
+    // a part that the optimized plan must contain
+    private @Nullable String expectedInPlan;
 
     @BeforeEach
     void setup() {
@@ -446,6 +448,9 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
                 .contains("GroupRefreshDeltaJoin(")
                 .contains("readBack=[")
                 .doesNotContain("upsertMaterialize=[true]");
+        if (expectedInPlan != null) {
+            assertThat(execPlan).as(query).contains(expectedInPlan);
+        }
         if (run % 3 == 2) {
             String json = tEnv.compilePlanSql(insert).asJsonString();
             assertThat(json).contains("\"readBack\"");
@@ -530,6 +535,27 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
     }
 
     /**
+     * Facts A referencing B, which references C: a change of B or C locates the facts through
+     * lookups by the referencing columns. Read in pages of one row, a change that leads to many
+     * facts hands them over page by page.
+     */
+    @Test
+    void testLocateInPagesConverges() throws Exception {
+        tEnv.getConfig()
+                .set(ExecutionConfigOptions.TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_PAGE_SIZE, 1);
+        long paged = 0;
+        for (int run = 0; run < RUNS; run++) {
+            Random random = new Random(18_000 + run);
+            String query =
+                    "SELECT a_id, b_v, c_v FROM A LEFT JOIN B ON a_k1 = b_id"
+                            + " LEFT JOIN C ON b_k1 = c_id";
+            runAndCompare(random, query, "a_id", run);
+            paged += SharedStoreTableFactory.pagedLookups(STORE);
+        }
+        assertThat(paged).as("lookups read in pages").isPositive();
+    }
+
+    /**
      * A star of B and C; in every second run with a condition beyond the keys, so that a parent can
      * have many children of which none matches, and is padded after the last page.
      */
@@ -597,6 +623,64 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
         }
         return script;
     }
+
+    /**
+     * Chains whose tables join their parent on the parent's key and the anchor key: B joins A on
+     * A's key, C joins B on B's key and B's anchor key, and D joins C on the anchor key. A refresh
+     * reads all rows of C of its group at once, and rows of C and D name their group themselves.
+     */
+    @Test
+    void testChainsKeyedByTheAnchorKeyConverge() throws Exception {
+        expectedInPlan = "readsGroupsOf=[#2]";
+        for (int run = 0; run < RUNS; run++) {
+            Random random = new Random(6000 + run);
+            String query =
+                    run % 2 == 0
+                            ? "SELECT a_id, b_id, c_id, a_v, b_v, c_v FROM A"
+                                    + CHAIN_KEYED_BY_ANCHOR_KEY
+                            : "SELECT a_id, b_id, c_id, d_id, a_v, b_v, c_v, d_v FROM A"
+                                    + CHAIN_KEYED_BY_ANCHOR_KEY
+                                    + " LEFT JOIN D ON d_k1 = c_k1";
+            runAndCompare(random, query, null, run);
+        }
+    }
+
+    @Test
+    void testChainsKeyedByTheAnchorKeyReadBackConverge() throws Exception {
+        configureReadBack();
+        expectedInPlan = "readsGroupsOf=[#2]";
+        for (int run = 0; run < RUNS; run++) {
+            Random random = new Random(7000 + run);
+            String query =
+                    "SELECT COALESCE(a_id, -1) AS a_id, COALESCE(b_id, -1) AS b_id,"
+                            + " COALESCE(c_id, -1) AS c_id, a_v, b_v, c_v FROM A"
+                            + CHAIN_KEYED_BY_ANCHOR_KEY;
+            List<String> diff = runReadBack(random, query, run);
+            assertThat(diff).as("run %s", run).isEmpty();
+        }
+    }
+
+    /**
+     * Snowflakes: A references B, which references C. Every row of A has at most one output row,
+     * and the output table, keyed by all ids, needs the old row of every change: the join reads it
+     * back.
+     */
+    @Test
+    void testSnowflakesReadBackConverge() throws Exception {
+        configureReadBack();
+        for (int run = 0; run < RUNS; run++) {
+            Random random = new Random(19_000 + run);
+            String query =
+                    "SELECT COALESCE(a_id, -1) AS a_id, COALESCE(b_id, -1) AS b_id,"
+                            + " COALESCE(c_id, -1) AS c_id, a_v, b_v, c_v FROM A"
+                            + " LEFT JOIN B ON a_k1 = b_id LEFT JOIN C ON b_k1 = c_id";
+            List<String> diff = runReadBack(random, query, run);
+            assertThat(diff).as("run %s", run).isEmpty();
+        }
+    }
+
+    private static final String CHAIN_KEYED_BY_ANCHOR_KEY =
+            " LEFT JOIN B ON b_k1 = a_id LEFT JOIN C ON c_k1 = b_k1 AND c_k2 = b_id";
 
     /** Without read-after-visible lookups the join does not converge, and the test notices. */
     @Test
@@ -680,6 +764,9 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
         assertThat(plan).as(query).contains("GroupRefreshDeltaJoin(");
         if (expectedMode != null) {
             assertThat(plan).as(query).contains("mode=[" + expectedMode + "]");
+        }
+        if (expectedInPlan != null) {
+            assertThat(plan).as(query).contains(expectedInPlan);
         }
         tEnv.executeSql(insert).await();
 

@@ -105,8 +105,14 @@ final class AnchorJoinEvaluator {
     /** Reads the fields of an anchor key row. */
     private transient RowData.FieldGetter[] keyRowGetters;
 
-    /** Per table, reads the anchor key from rows of the table before the anchor, or null. */
+    /** Per table, reads the anchor key from rows of its locate table, or null. */
     private transient RowData.FieldGetter[][] locateKeyGetters;
+
+    /** Per lookup into a table read per group, reads the lookup key from its rows; else null. */
+    private transient RowData.FieldGetter[][] groupIndexGetters;
+
+    /** Per lookup in {@link #groupIndexGetters}, the serializer of its keys. */
+    private transient RowDataSerializer[] groupIndexSerializers;
 
     /** Per lookup, whether it starts at the anchor table and needs only the anchor key. */
     private transient boolean[] keyedByAnchorKey;
@@ -199,11 +205,12 @@ final class AnchorJoinEvaluator {
 
         locateKeyGetters = new RowData.FieldGetter[tree.getNumLeaves()][];
         for (int leaf = 0; leaf < tree.getNumLeaves(); leaf++) {
-            int[] fields = tree.getAnchorKeyFieldsBeforeAnchor(leaf);
-            if (fields == null) {
+            int table = tree.getLocateTable(leaf);
+            if (table < 0) {
                 continue;
             }
-            RowType type = tree.getLeafType(tree.getTableBeforeAnchor(leaf));
+            int[] fields = tree.getAnchorKeyFieldsOf(table);
+            RowType type = tree.getLeafType(table);
             locateKeyGetters[leaf] = new RowData.FieldGetter[fields.length];
             for (int i = 0; i < fields.length; i++) {
                 locateKeyGetters[leaf][i] =
@@ -228,6 +235,44 @@ final class AnchorJoinEvaluator {
                     usedLookups[lookup]
                             && containsAll(keyFields, lookupSpecs[lookup].getSourceKeyFields());
         }
+        groupIndexGetters = new RowData.FieldGetter[lookupSpecs.length][];
+        groupIndexSerializers = new RowDataSerializer[lookupSpecs.length];
+        for (int e = 0; e < tree.getNumLeaves() - 1; e++) {
+            AnchorJoinTree.Edge edge = tree.getEdge(e);
+            indexGroupRows(edge.getLookupRight(), edge.getLeftFields(), edge.getRightLeaf(), edge.getRightFields());
+            indexGroupRows(edge.getLookupLeft(), edge.getRightFields(), edge.getLeftLeaf(), edge.getLeftFields());
+        }
+    }
+
+    /** Prepares serving a lookup from the group read of its table, if the edge maps every key. */
+    private void indexGroupRows(int lookupId, int[] sourceFields, int leaf, int[] leafFields) {
+        int groupLookup = tree.getGroupLookup(leaf);
+        if (leafOfLookup[lookupId] != leaf
+                || groupLookup < 0
+                || lookups[lookupId] == null
+                || lookups[groupLookup] == null) {
+            return;
+        }
+        int[] keyFields = lookupSpecs[lookupId].getSourceKeyFields();
+        LogicalType[] keyTypes = lookupSpecs[lookupId].getSourceKeyTypes();
+        RowType leafType = tree.getLeafType(leaf);
+        RowData.FieldGetter[] getters = new RowData.FieldGetter[keyFields.length];
+        for (int k = 0; k < keyFields.length; k++) {
+            int field = -1;
+            for (int i = 0; i < sourceFields.length && field < 0; i++) {
+                if (sourceFields[i] == keyFields[k]) {
+                    field = leafFields[i];
+                }
+            }
+            if (field < 0
+                    || !leafType.getTypeAt(field).copy(true).equals(keyTypes[k].copy(true))) {
+                // the rows are looked up one by one
+                return;
+            }
+            getters[k] = RowData.createFieldGetter(leafType.getTypeAt(field), field);
+        }
+        groupIndexGetters[lookupId] = getters;
+        groupIndexSerializers[lookupId] = new RowDataSerializer(keyTypes);
     }
 
     private static boolean containsAll(int[] fields, int[] required) {
@@ -343,6 +388,110 @@ final class AnchorJoinEvaluator {
                 });
     }
 
+    /** Whether locating anchors for rows of the given table reads a lookup of its path in pages. */
+    boolean locatesInPages(int leaf) {
+        for (int lookupId : tree.getLocateLookups(leaf)) {
+            if (lookups[lookupId] != null && lookups[lookupId].pagedFunction != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * As {@link #locate}, reading paged lookups page by page and handing keys to {@code onKeys} as
+     * found, so a row with many anchors never holds them all. Keys can repeat.
+     */
+    CompletableFuture<Void> locateInPages(
+            int leaf,
+            RowData row,
+            long start,
+            int pageSize,
+            Consumer<Collection<BinaryRowData>> onKeys) {
+        return locateFrom(tree.getLocateLookups(leaf), 0, row, start, pageSize, leaf, onKeys);
+    }
+
+    private CompletableFuture<Void> locateFrom(
+            int[] path,
+            int hop,
+            RowData row,
+            long start,
+            int pageSize,
+            int leaf,
+            Consumer<Collection<BinaryRowData>> onKeys) {
+        if (hop == path.length) {
+            RowData.FieldGetter[] keyGetters = locateKeyGetters[leaf];
+            BinaryRowData key = keyGetters == null ? anchorKeyOf(row) : keyOf(row, keyGetters);
+            if (key != null) {
+                onKeys.accept(Collections.singletonList(key));
+            }
+            return CompletableFuture.completedFuture(null);
+        }
+        Lookup lookup = lookups[path[hop]];
+        if (lookup.pagedFunction == null) {
+            return lookup.lookup(row, start)
+                    .thenCompose(
+                            rows -> {
+                                List<CompletableFuture<Void>> located =
+                                        new ArrayList<>(rows.size());
+                                for (RowData r : rows) {
+                                    located.add(
+                                            locateFrom(
+                                                    path, hop + 1, r, start, pageSize, leaf,
+                                                    onKeys));
+                                }
+                                return CompletableFuture.allOf(
+                                        located.toArray(new CompletableFuture[0]));
+                            });
+        }
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        TablePages pages;
+        try {
+            pages = lookup.openPages(row, pageSize);
+        } catch (Throwable t) {
+            done.completeExceptionally(t);
+            return done;
+        }
+        locatePages(pages, path, hop, start, pageSize, leaf, onKeys, done);
+        return done;
+    }
+
+    /** Locates the rows of the next page, then the page after it, until the last one. */
+    private void locatePages(
+            TablePages pages,
+            int[] path,
+            int hop,
+            long start,
+            int pageSize,
+            int leaf,
+            Consumer<Collection<BinaryRowData>> onKeys,
+            CompletableFuture<Void> done) {
+        pages.next(
+                (rows, last) -> {
+                    List<CompletableFuture<Void>> located = new ArrayList<>(rows.size());
+                    for (RowData r : rows) {
+                        located.add(locateFrom(path, hop + 1, r, start, pageSize, leaf, onKeys));
+                    }
+                    CompletableFuture.allOf(located.toArray(new CompletableFuture[0]))
+                            .whenComplete(
+                                    (ignored, error) ->
+                                            mailbox.execute(
+                                                    () -> {
+                                                        if (error != null) {
+                                                            pages.close();
+                                                            done.completeExceptionally(error);
+                                                        } else if (last) {
+                                                            done.complete(null);
+                                                        } else {
+                                                            locatePages(
+                                                                    pages, path, hop, start,
+                                                                    pageSize, leaf, onKeys, done);
+                                                        }
+                                                    }));
+                },
+                done::completeExceptionally);
+    }
+
     /** The anchor key read from a row with the given getters, or null if a field is NULL. */
     private @Nullable BinaryRowData keyOf(RowData row, RowData.FieldGetter[] getters) {
         GenericRowData key = new GenericRowData(getters.length);
@@ -447,6 +596,14 @@ final class AnchorJoinEvaluator {
         // first, so that it never waits for capacity behind lookups that depend on it
         CompletableFuture<List<RowData>> anchorRows =
                 lookups[tree.getAnchorLookup()].lookup(anchorKey, start);
+        // group reads first: the lookups below may be served by them
+        for (int leaf = 0; leaf < tree.getNumLeaves(); leaf++) {
+            int groupLookup = tree.getGroupLookup(leaf);
+            if (groupLookup >= 0 && lookups[groupLookup] != null) {
+                evaluation.readGroup(leaf, groupLookup, anchorKey);
+            }
+        }
+        evaluation.startAwayFromGroups();
         RowData keyOnly = null;
         for (int lookupId : lookupsAwayFrom[anchorLeaf]) {
             if (keyedByAnchorKey[lookupId]) {
@@ -654,6 +811,13 @@ final class AnchorJoinEvaluator {
         private final Map<Integer, Map<BinaryRowData, CompletableFuture<List<RowData>>>> results =
                 new HashMap<>();
 
+        /** Per table read by group, all its rows of the group. */
+        private final Map<Integer, CompletableFuture<List<RowData>>> groupRows = new HashMap<>();
+
+        /** Per lookup into a table read by group, the rows of the group by the key of the lookup. */
+        private final Map<Integer, CompletableFuture<Map<BinaryRowData, List<RowData>>>>
+                groupIndexes = new HashMap<>();
+
         private Evaluation(long start, @Nullable RowScope scope) {
             this(start, scope, Collections.emptyMap());
         }
@@ -690,6 +854,23 @@ final class AnchorJoinEvaluator {
             Map<BinaryRowData, CompletableFuture<List<RowData>>> byKey =
                     results.computeIfAbsent(lookupId, id -> new HashMap<>());
             CompletableFuture<List<RowData>> result = byKey.get(key);
+            int target = leafOfLookup[lookupId];
+            if (result == null && target >= 0 && groupIndexGetters[lookupId] != null) {
+                CompletableFuture<List<RowData>> rows = groupRows.get(target);
+                if (rows != null) {
+                    // served by the group read
+                    result =
+                            groupIndexes
+                                    .computeIfAbsent(
+                                            lookupId, id -> rows.thenApply(all -> index(id, all)))
+                                    .thenApply(
+                                            index ->
+                                                    index.getOrDefault(
+                                                            key, Collections.emptyList()));
+                    byKey.put(key, result);
+                    return result;
+                }
+            }
             if (result == null) {
                 result = lookup.lookup(source, key, start);
                 byKey.put(key, result);
@@ -704,6 +885,54 @@ final class AnchorJoinEvaluator {
                 }
             }
             return result;
+        }
+
+        /** Reads all rows of a table that belong to the group of the anchor key. */
+        void readGroup(int leaf, int groupLookup, RowData anchorKey) {
+            Lookup lookup = lookups[groupLookup];
+            BinaryRowData key = lookup.keyOrNull(anchorKey);
+            CompletableFuture<List<RowData>> rows =
+                    key == null
+                            ? CompletableFuture.completedFuture(Collections.emptyList())
+                            : lookup.lookup(anchorKey, key, start);
+            groupRows.put(leaf, rows);
+        }
+
+        /** Starts the lookups beyond the rows of every table read by group, once they arrive. */
+        void startAwayFromGroups() {
+            for (Map.Entry<Integer, CompletableFuture<List<RowData>>> entry : groupRows.entrySet()) {
+                int leaf = entry.getKey();
+                entry.getValue()
+                        .thenAccept(
+                                all -> {
+                                    for (RowData row : all) {
+                                        startAwayFrom(leaf, row);
+                                    }
+                                });
+            }
+        }
+
+        /** The rows of a table read by group, by the key of a lookup into the table. */
+        private Map<BinaryRowData, List<RowData>> index(int lookupId, List<RowData> rows) {
+            RowData.FieldGetter[] getters = groupIndexGetters[lookupId];
+            Map<BinaryRowData, List<RowData>> index = new HashMap<>();
+            for (RowData row : rows) {
+                GenericRowData key = new GenericRowData(getters.length);
+                boolean hasNull = false;
+                for (int i = 0; i < getters.length; i++) {
+                    Object value = getters[i].getFieldOrNull(row);
+                    hasNull |= value == null;
+                    key.setField(i, value);
+                }
+                if (!hasNull) {
+                    // NULL never equals anything
+                    index.computeIfAbsent(
+                                    groupIndexSerializers[lookupId].toBinaryRow(key, true),
+                                    k -> new ArrayList<>())
+                            .add(row);
+                }
+            }
+            return index;
         }
 
         /** Starts the lookups into the tables one step further away from the anchor than a row. */

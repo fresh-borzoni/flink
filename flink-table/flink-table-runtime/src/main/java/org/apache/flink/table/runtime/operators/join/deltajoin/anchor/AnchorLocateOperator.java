@@ -91,6 +91,12 @@ public class AnchorLocateOperator extends TableStreamOperator<RowData>
      */
     private final boolean equalityJoin;
 
+    /** Rows per page of lookups on the way to the anchor that read in pages; 0 for none. */
+    private final int pageSize;
+
+    /** Whether the lookups on the way to the anchor are read in pages. */
+    private transient boolean locatesInPages;
+
     private final transient MailboxExecutor mailboxExecutor;
 
     private transient AnchorJoinEvaluator evaluator;
@@ -127,7 +133,8 @@ public class AnchorLocateOperator extends TableStreamOperator<RowData>
             int capacity,
             AnchorNotes notes,
             int[] uniqueKey,
-            boolean equalityJoin) {
+            boolean equalityJoin,
+            int pageSize) {
         super(parameters);
         Preconditions.checkArgument(capacity > 0, "The capacity must be positive: %s", capacity);
         this.tree = tree;
@@ -140,6 +147,7 @@ public class AnchorLocateOperator extends TableStreamOperator<RowData>
         this.notes = notes;
         this.uniqueKey = uniqueKey;
         this.equalityJoin = equalityJoin;
+        this.pageSize = pageSize;
     }
 
     private static GeneratedFilterCondition[][] emptyFilters(int numNodes) {
@@ -183,6 +191,7 @@ public class AnchorLocateOperator extends TableStreamOperator<RowData>
                 DefaultOpenContext.INSTANCE,
                 tree.lookupsUsedToLocate(leaf, lookupSpecs.length),
                 false);
+        locatesInPages = pageSize > 0 && evaluator.locatesInPages(leaf);
         restoredWork = new ArrayDeque<>();
         getRuntimeContext().getMetricGroup().gauge("numLookups", evaluator::getNumLookups);
         getRuntimeContext().getMetricGroup().gauge("numInFlight", () -> inFlight);
@@ -365,6 +374,32 @@ public class AnchorLocateOperator extends TableStreamOperator<RowData>
 
     private void startLocate(long id, RowData row) {
         inFlight++;
+        if (locatesInPages) {
+            // a row can lead to many anchors: their notes go out page by page
+            evaluator
+                    .locateInPages(
+                            leaf,
+                            row,
+                            evaluator.newStamp(),
+                            pageSize,
+                            keys -> {
+                                for (BinaryRowData key : keys) {
+                                    output.collect(new StreamRecord<>(notes.note(key, leaf, row)));
+                                }
+                                numAnchorKeysLocated.inc(keys.size());
+                            })
+                    .whenComplete(
+                            (ignored, error) -> {
+                                if (error != null) {
+                                    fail("Could not locate the anchor rows of " + row, error);
+                                    return;
+                                }
+                                inFlightRows.remove(id);
+                                inFlight--;
+                                startRestoredWork();
+                            });
+            return;
+        }
         evaluator
                 .locate(leaf, row, evaluator.newStamp())
                 .whenComplete(

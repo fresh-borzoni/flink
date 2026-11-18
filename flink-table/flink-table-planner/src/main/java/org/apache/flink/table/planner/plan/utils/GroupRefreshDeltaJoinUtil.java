@@ -68,6 +68,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -130,6 +131,9 @@ public final class GroupRefreshDeltaJoinUtil {
 
         /** The output field of every anchor key field, or null if one is not in the output. */
         public @Nullable int[] outputAnchorKeyPositions;
+
+        /** Per table, the fields holding the anchor key if it is read per group; null otherwise. */
+        public @Nullable int[][] groupReadFields;
 
         private JoinTree() {
             this.leafInputs = new ArrayList<>();
@@ -282,6 +286,7 @@ public final class GroupRefreshDeltaJoinUtil {
             chooseAnchor(tree);
             computeOldImages(tree);
             computeOutputAnchorKey(tree);
+            computeGroupReads(tree);
             return Optional.of(tree);
         } catch (Unsupported e) {
             LOG.debug(
@@ -715,6 +720,122 @@ public final class GroupRefreshDeltaJoinUtil {
         }
     }
 
+    /**
+     * Tables two or more joins from the anchor whose rows hold the anchor key and are looked up
+     * by it: a refresh reads them once per group instead of once per parent row.
+     */
+    private static void computeGroupReads(JoinTree tree) {
+        int numLeaves = tree.numLeaves();
+        int[] next = new int[numLeaves];
+        Arrays.fill(next, -2);
+        next[tree.anchorLeaf] = -1;
+        int[][] keyFields = new int[numLeaves][];
+        keyFields[tree.anchorLeaf] = tree.anchorKey;
+        List<Integer> order = new ArrayList<>();
+        Deque<Integer> queue = new ArrayDeque<>();
+        queue.add(tree.anchorLeaf);
+        while (!queue.isEmpty()) {
+            int current = queue.poll();
+            for (PlannerEdge edge : tree.edges) {
+                int other =
+                        edge.leftLeaf == current
+                                ? edge.rightLeaf
+                                : edge.rightLeaf == current ? edge.leftLeaf : -1;
+                if (other >= 0 && next[other] == -2) {
+                    next[other] = current;
+                    order.add(other);
+                    queue.add(other);
+                }
+            }
+        }
+        RowType anchorType =
+                FlinkTypeFactory.toLogicalRowType(
+                        tree.leafInputs.get(tree.anchorLeaf).getRowType());
+        tree.groupReadFields = new int[numLeaves][];
+        for (int leaf : order) {
+            int towards = next[leaf];
+            int node = joinOfEdgeBetween(tree, leaf, towards);
+            if (keyFields[towards] == null
+                    || (towards != tree.anchorLeaf && !keptOnlyWhereMatched(tree, node, leaf))) {
+                continue;
+            }
+            PlannerEdge edge = tree.edges.get(tree.nodes.get(node).edge);
+            int[] leafSide = edge.fieldsOf(leaf);
+            int[] towardsSide = edge.fieldsOf(towards);
+            RowType leafType =
+                    FlinkTypeFactory.toLogicalRowType(tree.leafInputs.get(leaf).getRowType());
+            int[] fields = new int[tree.anchorKey.length];
+            boolean covered = true;
+            for (int k = 0; k < fields.length && covered; k++) {
+                int found = -1;
+                for (int i = 0; i < towardsSide.length && found < 0; i++) {
+                    if (towardsSide[i] == keyFields[towards][k]) {
+                        found = leafSide[i];
+                    }
+                }
+                covered =
+                        found >= 0
+                                && leafType.getTypeAt(found)
+                                        .copy(true)
+                                        .equals(anchorType.getTypeAt(tree.anchorKey[k]).copy(true));
+                fields[k] = found;
+            }
+            if (!covered) {
+                continue;
+            }
+            keyFields[leaf] = fields;
+            if (towards == tree.anchorLeaf || leafSide.length <= fields.length) {
+                // next to the anchor, or looked up by the anchor key anyway: nothing to save
+                continue;
+            }
+            int[] sourceFields = toSourceFields(tree, leaf, fields);
+            if (sourceFields != null
+                    && DeltaJoinUtil.isTableScanSupported(
+                            tree.leafScans.get(leaf), sourceFields)) {
+                tree.groupReadFields[leaf] = fields;
+            }
+        }
+    }
+
+    /** The join whose equality columns connect two adjacent tables. */
+    private static int joinOfEdgeBetween(JoinTree tree, int a, int b) {
+        for (int n = 0; n < tree.nodes.size(); n++) {
+            PlannerNode node = tree.nodes.get(n);
+            if (node.isLeaf()) {
+                continue;
+            }
+            PlannerEdge edge = tree.edges.get(node.edge);
+            if ((edge.leftLeaf == a && edge.rightLeaf == b)
+                    || (edge.leftLeaf == b && edge.rightLeaf == a)) {
+                return n;
+            }
+        }
+        throw new IllegalStateException("No join connects tables " + a + " and " + b);
+    }
+
+    /** Whether the join keeps rows of the table only where its equality columns matched. */
+    private static boolean keptOnlyWhereMatched(JoinTree tree, int node, int leaf) {
+        PlannerNode join = tree.nodes.get(node);
+        boolean inLeft = containsLeaf(tree, join.left, leaf);
+        switch (join.joinType) {
+            case INNER:
+                return true;
+            case LEFT:
+                return !inLeft;
+            case RIGHT:
+                return inLeft;
+            default:
+                return false;
+        }
+    }
+
+    private static boolean containsLeaf(JoinTree tree, int node, int leaf) {
+        PlannerNode n = tree.nodes.get(node);
+        return n.isLeaf()
+                ? n.leaf == leaf
+                : containsLeaf(tree, n.left, leaf) || containsLeaf(tree, n.right, leaf);
+    }
+
     /** The smallest unique key of the table that it supports lookups on. */
     private static Optional<int[]> lookupableKey(JoinTree tree, int leaf) {
         return upsertKeys(tree, leaf).stream()
@@ -1055,6 +1176,24 @@ public final class GroupRefreshDeltaJoinUtil {
                             ImmutableIntList.of(keyRowFields), ImmutableIntList.of(tree.anchorKey));
             anchorLookup = lookupSpec(tree, anchorInfo, tree.anchorLeaf, cluster, true);
         }
+        List<GroupRefreshDeltaJoinSpec.GroupRead> groupReads = new ArrayList<>();
+        if (tree.grouping == GroupRefreshDeltaJoinSpec.Grouping.ANCHOR
+                && tree.groupReadFields != null) {
+            int[] keyRowFields = new int[tree.anchorKey.length];
+            for (int i = 0; i < keyRowFields.length; i++) {
+                keyRowFields[i] = i;
+            }
+            for (int leaf = 0; leaf < tree.numLeaves(); leaf++) {
+                int[] fields = tree.groupReadFields[leaf];
+                if (fields != null) {
+                    JoinInfo info =
+                            JoinInfo.of(ImmutableIntList.of(keyRowFields), ImmutableIntList.of(fields));
+                    groupReads.add(
+                            new GroupRefreshDeltaJoinSpec.GroupRead(
+                                    leaf, fields, lookupSpec(tree, info, leaf, cluster, true)));
+                }
+            }
+        }
         // the rows a table returns to lookups are its current rows, which its unique keys identify
         List<int[]> leafKeys = new ArrayList<>();
         for (RelNode input : tree.leafInputs) {
@@ -1070,7 +1209,8 @@ public final class GroupRefreshDeltaJoinUtil {
                 tree.anchorKey,
                 anchorLookup,
                 leafKeys,
-                tree.grouping);
+                tree.grouping,
+                groupReads);
     }
 
     private static DeltaJoinSpec lookupSpec(

@@ -332,6 +332,21 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
         }
 
         int numLeaves = spec.getLeafTypes().size();
+        // tables whose rows of a whole group are read at once by the anchor key
+        int[] groupLookups = new int[numLeaves];
+        Arrays.fill(groupLookups, -1);
+        for (GroupRefreshDeltaJoinSpec.GroupRead read : spec.getGroupReads()) {
+            groupLookups[read.getLeaf()] = lookups.size();
+            lookups.add(
+                    lookup(
+                            planner,
+                            config,
+                            typeFactory,
+                            read.getLookup(),
+                            anchorKeyType,
+                            spec.getLeafTypes().get(read.getLeaf()),
+                            "group of #" + read.getLeaf()));
+        }
         List<GroupRefreshDeltaJoinSpec.Node> specNodes = spec.getNodes();
         AnchorJoinTree.Node[] nodes = new AnchorJoinTree.Node[specNodes.size()];
         GeneratedJoinCondition[] conditions = new GeneratedJoinCondition[specNodes.size()];
@@ -385,7 +400,8 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
                         edges,
                         spec.getAnchorLeaf(),
                         spec.getAnchorKey(),
-                        0);
+                        0,
+                        groupLookups);
         AnchorLookupSpec[] lookupSpecs = lookups.toArray(new AnchorLookupSpec[0]);
         long timeoutMs =
                 config.get(ExecutionConfigOptions.TABLE_EXEC_ASYNC_LOOKUP_TIMEOUT).toMillis();
@@ -438,7 +454,8 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
                                     capacity,
                                     notes,
                                     withRows[i] ? spec.getLeafKeys().get(i) : new int[0],
-                                    withRows[i] && joinsAnchorByEqualities(tree, i)),
+                                    withRows[i] && joinsAnchorByEqualities(tree, i),
+                                    pageSize(config)),
                             InternalTypeInfo.of(notes.getType()),
                             input.getParallelism(),
                             0,

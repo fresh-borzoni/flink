@@ -357,6 +357,7 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                         anchorGroups
                                 ? "anchor #" + tree.anchorLeaf + "(" + anchorKey + ")"
                                 : "join key")
+                .itemIf("readsGroupsOf", groupReadsString(), groupReadsString() != null)
                 .itemIf("mode", traitsInferred ? getOutputMode() : null, traitsInferred)
                 .itemIf(
                         "readBack",
@@ -370,6 +371,21 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                         readBack != null)
                 .itemIf("projection", projectionString(), readBack != null)
                 .item("select", String.join(", ", getRowType().getFieldNames()));
+    }
+
+    /** The tables whose rows of a group a refresh reads at once, e.g. {@code #2, #3}; or null. */
+    private @Nullable String groupReadsString() {
+        if (tree.grouping != GroupRefreshDeltaJoinSpec.Grouping.ANCHOR
+                || tree.groupReadFields == null) {
+            return null;
+        }
+        List<String> leaves = new ArrayList<>();
+        for (int leaf = 0; leaf < tree.groupReadFields.length; leaf++) {
+            if (tree.groupReadFields[leaf] != null) {
+                leaves.add("#" + leaf);
+            }
+        }
+        return leaves.isEmpty() ? null : String.join(", ", leaves);
     }
 
     private @Nullable String projectionString() {

@@ -32,6 +32,7 @@ import org.apache.calcite.rex.RexNode;
 
 import javax.annotation.Nullable;
 
+import java.util.Collections;
 import java.util.List;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -56,6 +57,7 @@ public class GroupRefreshDeltaJoinSpec {
     public static final String FIELD_NAME_ANCHOR_LOOKUP = "anchorLookup";
     public static final String FIELD_NAME_LEAF_KEYS = "leafKeys";
     public static final String FIELD_NAME_GROUPING = "grouping";
+    public static final String FIELD_NAME_GROUP_READS = "groupReads";
 
     /** Which output rows form a group that is refreshed as a whole. */
     public enum Grouping {
@@ -94,6 +96,32 @@ public class GroupRefreshDeltaJoinSpec {
     @JsonProperty(FIELD_NAME_LEAF_KEYS)
     private final List<int[]> leafKeys;
 
+    /** Tables whose rows of a whole group are read at once by the anchor key. */
+    @JsonProperty(FIELD_NAME_GROUP_READS)
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private final List<GroupRead> groupReads;
+
+    public GroupRefreshDeltaJoinSpec(
+            List<RowType> leafTypes,
+            List<Node> nodes,
+            List<Edge> edges,
+            int anchorLeaf,
+            int[] anchorKey,
+            @Nullable DeltaJoinSpec anchorLookup,
+            List<int[]> leafKeys,
+            Grouping grouping) {
+        this(
+                leafTypes,
+                nodes,
+                edges,
+                anchorLeaf,
+                anchorKey,
+                anchorLookup,
+                leafKeys,
+                grouping,
+                null);
+    }
+
     @JsonCreator
     public GroupRefreshDeltaJoinSpec(
             @JsonProperty(FIELD_NAME_LEAF_TYPES) List<RowType> leafTypes,
@@ -103,7 +131,8 @@ public class GroupRefreshDeltaJoinSpec {
             @JsonProperty(FIELD_NAME_ANCHOR_KEY) int[] anchorKey,
             @JsonProperty(FIELD_NAME_ANCHOR_LOOKUP) @Nullable DeltaJoinSpec anchorLookup,
             @JsonProperty(FIELD_NAME_LEAF_KEYS) List<int[]> leafKeys,
-            @JsonProperty(FIELD_NAME_GROUPING) Grouping grouping) {
+            @JsonProperty(FIELD_NAME_GROUPING) Grouping grouping,
+            @JsonProperty(FIELD_NAME_GROUP_READS) @Nullable List<GroupRead> groupReads) {
         this.leafTypes = leafTypes;
         this.nodes = nodes;
         this.edges = edges;
@@ -112,6 +141,7 @@ public class GroupRefreshDeltaJoinSpec {
         this.anchorLookup = anchorLookup;
         this.leafKeys = checkNotNull(leafKeys);
         this.grouping = checkNotNull(grouping);
+        this.groupReads = groupReads == null ? Collections.emptyList() : groupReads;
     }
 
     @JsonIgnore
@@ -152,6 +182,56 @@ public class GroupRefreshDeltaJoinSpec {
 
     public @Nullable DeltaJoinSpec getAnchorLookup() {
         return anchorLookup;
+    }
+
+    @JsonIgnore
+    public List<GroupRead> getGroupReads() {
+        return groupReads;
+    }
+
+    /** A table read once per group by the anchor key. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class GroupRead {
+
+        public static final String FIELD_NAME_LEAF = "leaf";
+        public static final String FIELD_NAME_FIELDS = "fields";
+        public static final String FIELD_NAME_LOOKUP = "lookup";
+
+        @JsonProperty(FIELD_NAME_LEAF)
+        private final int leaf;
+
+        /** The fields of the table equal to the anchor key fields, in the order of the key. */
+        @JsonProperty(FIELD_NAME_FIELDS)
+        private final int[] fields;
+
+        /** Looks up the rows of the table by a row that holds the anchor key. */
+        @JsonProperty(FIELD_NAME_LOOKUP)
+        private final DeltaJoinSpec lookup;
+
+        @JsonCreator
+        public GroupRead(
+                @JsonProperty(FIELD_NAME_LEAF) int leaf,
+                @JsonProperty(FIELD_NAME_FIELDS) int[] fields,
+                @JsonProperty(FIELD_NAME_LOOKUP) DeltaJoinSpec lookup) {
+            this.leaf = leaf;
+            this.fields = fields;
+            this.lookup = lookup;
+        }
+
+        @JsonIgnore
+        public int getLeaf() {
+            return leaf;
+        }
+
+        @JsonIgnore
+        public int[] getFields() {
+            return fields;
+        }
+
+        @JsonIgnore
+        public DeltaJoinSpec getLookup() {
+            return lookup;
+        }
     }
 
     /** A table or a join. */

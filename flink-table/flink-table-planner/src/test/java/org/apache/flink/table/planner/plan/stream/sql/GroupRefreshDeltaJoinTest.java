@@ -573,4 +573,152 @@ class GroupRefreshDeltaJoinTest extends TableTestBase {
                 .contains("groups=[join key]")
                 .contains("readBack=[default_catalog.default_database.country_shipments]");
     }
+
+    /**
+     * Every table of a chain is keyed by the keys of its parent and its own id, and joins its
+     * parent on the parent's key. The output key holds the id of every table once: a row of a
+     * child exists only where its parent ids equal the parent's, which the output key holds.
+     */
+    @Test
+    void testReadBackOfChainKeyedByParentKeys() {
+        readBack();
+        chainTables();
+        readBackSink(
+                "customer_lines",
+                Schema.newBuilder()
+                        .column("customer_id", DataTypes.INT().notNull())
+                        .column("order_id", DataTypes.INT().notNull())
+                        .column("line_id", DataTypes.INT().notNull())
+                        .column("name", DataTypes.STRING())
+                        .column("amount", DataTypes.INT())
+                        .column("qty", DataTypes.INT())
+                        .primaryKey("customer_id", "order_id", "line_id")
+                        .index("customer_id")
+                        .build());
+        String sql =
+                "INSERT INTO customer_lines SELECT c.customer_id, COALESCE(o.order_id, -1),"
+                        + " COALESCE(l.line_id, -1), c.name, o.amount, l.qty"
+                        + " FROM customers c"
+                        + " LEFT JOIN chain_orders o ON o.customer_id = c.customer_id"
+                        + " LEFT JOIN chain_lines l"
+                        + " ON l.customer_id = o.customer_id AND l.order_id = o.order_id";
+        assertThat(explainAuto(sql))
+                .contains("groups=[anchor #0(customer_id)]")
+                .contains("readBack=[default_catalog.default_database.customer_lines]")
+                // lines hold the customer id and can be looked up by it alone: read per group
+                .contains("readsGroupsOf=[#2]");
+    }
+
+    /** Without the order id in the output key, lines of two orders are not told apart. */
+    @Test
+    void testNoReadBackOfChainWithoutParentKey() {
+        readBack();
+        chainTables();
+        readBackSink(
+                "customer_lines_by_line",
+                Schema.newBuilder()
+                        .column("customer_id", DataTypes.INT().notNull())
+                        .column("line_id", DataTypes.INT().notNull())
+                        .column("name", DataTypes.STRING())
+                        .column("qty", DataTypes.INT())
+                        .primaryKey("customer_id", "line_id")
+                        .index("customer_id")
+                        .build());
+        util.tableEnv()
+                .getConfig()
+                .set(
+                        OptimizerConfigOptions.TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_GROUPING,
+                        OptimizerConfigOptions.DeltaJoinGrouping.AUTO);
+        assertReadBackRefused(
+                "INSERT INTO customer_lines_by_line SELECT c.customer_id,"
+                        + " COALESCE(l.line_id, -1), c.name, l.qty"
+                        + " FROM customers c"
+                        + " LEFT JOIN chain_orders o ON o.customer_id = c.customer_id"
+                        + " LEFT JOIN chain_lines l"
+                        + " ON l.customer_id = o.customer_id AND l.order_id = o.order_id"
+                        + " ON CONFLICT DO DEDUPLICATE",
+                "default_catalog.default_database.customer_lines_by_line: the primary key does"
+                        + " not hold the unique key of table #1");
+    }
+
+    /**
+     * Every group has at most one row. An output table keyed by the anchor key that deletes by key
+     * takes upserts by the anchor key, also if it could be read back; one that needs the whole old
+     * row of a delete gets it by reading the row back.
+     */
+    @Test
+    void testSingleRowGroupsReadBackOnlyIfTheSinkNeedsOldRows() {
+        readBack();
+        util.tableEnv()
+                .getConfig()
+                .set(
+                        OptimizerConfigOptions.TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_GROUPING,
+                        OptimizerConfigOptions.DeltaJoinGrouping.AUTO);
+        Schema schema =
+                Schema.newBuilder()
+                        .column("order_id", DataTypes.INT().notNull())
+                        .column("customer_id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("order_id")
+                        .index("order_id")
+                        .build();
+        util.tableEnv()
+                .createTable(
+                        "order_names",
+                        TableDescriptor.forConnector("values")
+                                .schema(schema)
+                                .option("sink-insert-only", "false")
+                                .option("sink.supports-delete-by-key", "true")
+                                .build());
+        for (boolean fullDeletes : new boolean[] {false, true}) {
+            util.tableEnv()
+                    .createTable(
+                            fullDeletes ? "order_names_full_deletes" : "order_names_readable",
+                            TableDescriptor.forConnector(SharedStoreTableFactory.IDENTIFIER)
+                                    .schema(schema)
+                                    .option(SharedStoreTableFactory.STORE, "plan-test")
+                                    .option(SharedStoreTableFactory.SINK_FULL_DELETES, fullDeletes)
+                                    .build());
+        }
+        String query =
+                " SELECT o.order_id, o.customer_id, c.name FROM orders o"
+                        + " LEFT JOIN customers c ON o.customer_id = c.customer_id";
+        for (String sink : new String[] {"order_names", "order_names_readable"}) {
+            assertThat(explain("INSERT INTO " + sink + query))
+                    .contains("groups=[anchor #0(order_id)]")
+                    .contains("mode=[UPSERT]")
+                    .doesNotContain("readBack=[");
+        }
+        assertThat(explain("INSERT INTO order_names_full_deletes" + query))
+                .contains("groups=[anchor #0(order_id)]")
+                .contains("readBack=[default_catalog.default_database.order_names_full_deletes]");
+    }
+
+    /** Orders keyed by their customer and lines keyed by their customer and order. */
+    private void chainTables() {
+        source(
+                "chain_orders",
+                Schema.newBuilder()
+                        .column("customer_id", DataTypes.INT().notNull())
+                        .column("order_id", DataTypes.INT().notNull())
+                        .column("amount", DataTypes.INT())
+                        .primaryKey("customer_id", "order_id")
+                        .index("customer_id")
+                        .build(),
+                ALL_CHANGES,
+                Map.of());
+        source(
+                "chain_lines",
+                Schema.newBuilder()
+                        .column("customer_id", DataTypes.INT().notNull())
+                        .column("order_id", DataTypes.INT().notNull())
+                        .column("line_id", DataTypes.INT().notNull())
+                        .column("qty", DataTypes.INT())
+                        .primaryKey("customer_id", "order_id", "line_id")
+                        .index("customer_id", "order_id")
+                        .index("customer_id")
+                        .build(),
+                ALL_CHANGES,
+                Map.of());
+    }
 }

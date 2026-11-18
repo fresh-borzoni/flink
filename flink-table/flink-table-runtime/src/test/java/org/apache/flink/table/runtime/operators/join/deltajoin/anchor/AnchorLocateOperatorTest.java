@@ -368,7 +368,8 @@ class AnchorLocateOperatorTest {
                         16,
                         AnchorNotes.of(tree, new boolean[] {false, withRows}),
                         withRows ? new int[] {0} : new int[0],
-                        equalityJoin),
+                        equalityJoin,
+                        0),
                 maxParallelism,
                 parallelism,
                 subtask);
