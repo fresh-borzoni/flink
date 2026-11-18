@@ -98,31 +98,28 @@ public class RecordsBuffer<ELEMENT, KEY> {
         }
     }
 
-    /** Collect all elements which are not emitted for snapshot. */
+    /**
+     * Collects all elements which are not emitted yet, for a snapshot.
+     *
+     * <p>The elements of a key are returned in the order they arrived, so that replaying them after
+     * a restore processes them in the same order: the finished ones first, then the one in flight,
+     * then the waiting ones. Elements of one key are processed one at a time, so every finished
+     * element arrived before the element in flight, which arrived before the waiting ones.
+     *
+     * <p>The returned deques are copies. Changing them does not change this buffer.
+     */
     public Map<KEY, Deque<ELEMENT>> pendingElements() {
-        Map<KEY, Deque<ELEMENT>> mergedMap = new HashMap<>();
+        Map<KEY, Deque<ELEMENT>> pending = new HashMap<>();
         finishedBuffer.forEach(
-                (key, value) ->
-                        mergedMap.merge(
-                                key,
-                                value,
-                                (existingValue, newValue) -> {
-                                    existingValue.addAll(newValue);
-                                    return existingValue;
-                                }));
+                (key, elements) ->
+                        pending.computeIfAbsent(key, k -> new ArrayDeque<>()).addAll(elements));
         activeBuffer.forEach(
-                (key, value) ->
-                        mergedMap.computeIfAbsent(key, k -> new ArrayDeque<>()).push(value));
+                (key, element) ->
+                        pending.computeIfAbsent(key, k -> new ArrayDeque<>()).addLast(element));
         blockingBuffer.forEach(
-                (key, value) ->
-                        mergedMap.merge(
-                                key,
-                                value,
-                                (existingValue, newValue) -> {
-                                    existingValue.addAll(newValue);
-                                    return existingValue;
-                                }));
-        return mergedMap;
+                (key, elements) ->
+                        pending.computeIfAbsent(key, k -> new ArrayDeque<>()).addAll(elements));
+        return pending;
     }
 
     public String sizeToString() {

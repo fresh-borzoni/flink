@@ -68,6 +68,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * This operator serves a similar purpose to {@link AsyncWaitOperator}. Unlike {@link
@@ -220,6 +221,9 @@ public class TableKeyedAsyncWaitOperator<IN, OUT, KEY>
             CheckpointOptions checkpointOptions,
             CheckpointStreamFactory factory)
             throws Exception {
+        // A key whose records were all emitted since the previous checkpoint still holds the
+        // records stored by that checkpoint. They must not be replayed after a restore.
+        clearRecoveredStreamElements();
         Map<KEY, Deque<AecRecord<IN, OUT>>> pendingElements =
                 asyncExecutionController.pendingElements();
         for (Map.Entry<KEY, Deque<AecRecord<IN, OUT>>> entry : pendingElements.entrySet()) {
@@ -233,6 +237,18 @@ public class TableKeyedAsyncWaitOperator<IN, OUT, KEY>
             recoveredStreamElements.update(value);
         }
         return super.snapshotState(checkpointId, timestamp, checkpointOptions, factory);
+    }
+
+    private void clearRecoveredStreamElements() throws Exception {
+        List<Object> keys;
+        try (Stream<Object> stored =
+                getKeyedStateBackend().getKeys(STATE_NAME, VoidNamespace.INSTANCE)) {
+            keys = stored.collect(Collectors.toList());
+        }
+        for (Object key : keys) {
+            setCurrentKey(key);
+            recoveredStreamElements.clear();
+        }
     }
 
     @Override

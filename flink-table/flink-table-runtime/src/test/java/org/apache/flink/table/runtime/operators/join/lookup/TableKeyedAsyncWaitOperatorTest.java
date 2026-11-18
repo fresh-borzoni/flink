@@ -25,8 +25,11 @@ import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
 import org.apache.flink.runtime.operators.testutils.MockEnvironment;
 import org.apache.flink.streaming.api.functions.async.AsyncFunction;
+import org.apache.flink.streaming.api.functions.async.ResultFuture;
+import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.tasks.mailbox.Mail;
 import org.apache.flink.streaming.util.KeyedOneInputStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.TestHarnessUtil;
 import org.apache.flink.table.runtime.operators.TableKeyedAsyncWaitOperator;
@@ -40,12 +43,16 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
@@ -449,6 +456,147 @@ public class TableKeyedAsyncWaitOperatorTest {
                                         mockEnvironment.getActualExternalFailureCause().get(),
                                         expectedException.get())
                                 .isPresent());
+            }
+        }
+    }
+
+    /**
+     * Records of one key are emitted in arrival order after a restore, even if the checkpoint saw a
+     * finished record that waits for an earlier watermark, a record in flight and a waiting record
+     * of that key.
+     */
+    @Test
+    void testRestoreKeepsOrderOfRecordsWithSameKey() throws Exception {
+        OperatorSubtaskState snapshot;
+        ControlledAsyncFunction function = new ControlledAsyncFunction();
+        try (KeyedOneInputStreamOperatorTestHarness<Integer, Integer, Integer> testHarness =
+                createKeyedByTensTestHarness(function)) {
+            testHarness.open();
+            processFinishedActiveAndWaitingRecords(testHarness, function);
+            snapshot = testHarness.snapshot(0L, 0L);
+            function.releaseAll();
+            testHarness.endInput();
+        }
+
+        try (KeyedOneInputStreamOperatorTestHarness<Integer, Integer, Integer> testHarness =
+                createKeyedByTensTestHarness(new ControlledAsyncFunction())) {
+            testHarness.initializeState(snapshot);
+            testHarness.open();
+            testHarness.endInput();
+            assertThat(recordValuesOfKey(testHarness.getOutput(), 1)).containsExactly(10, 11, 12);
+            assertThat(recordValuesOfKey(testHarness.getOutput(), 0)).containsExactly(0);
+        }
+    }
+
+    /** Records that were emitted after a checkpoint are not part of a later checkpoint. */
+    @Test
+    void testLaterSnapshotDoesNotContainEmittedRecords() throws Exception {
+        OperatorSubtaskState snapshot;
+        ControlledAsyncFunction function = new ControlledAsyncFunction();
+        try (KeyedOneInputStreamOperatorTestHarness<Integer, Integer, Integer> testHarness =
+                createKeyedByTensTestHarness(function)) {
+            testHarness.open();
+            processFinishedActiveAndWaitingRecords(testHarness, function);
+            testHarness.snapshot(0L, 0L);
+
+            function.releaseAll();
+            runMails(testHarness);
+            assertThat(recordValuesOfKey(testHarness.getOutput(), 1)).containsExactly(10, 11, 12);
+            snapshot = testHarness.snapshot(1L, 1L);
+            testHarness.endInput();
+        }
+
+        try (KeyedOneInputStreamOperatorTestHarness<Integer, Integer, Integer> testHarness =
+                createKeyedByTensTestHarness(new ControlledAsyncFunction())) {
+            testHarness.initializeState(snapshot);
+            testHarness.open();
+            testHarness.endInput();
+            assertThat(testHarness.getOutput()).noneMatch(e -> e instanceof StreamRecord);
+        }
+    }
+
+    /**
+     * Leaves key 1 (values 10 to 19) with a finished record that waits for the record of key 0
+     * before the watermark, a record in flight and a waiting record.
+     */
+    private static void processFinishedActiveAndWaitingRecords(
+            KeyedOneInputStreamOperatorTestHarness<Integer, Integer, Integer> testHarness,
+            ControlledAsyncFunction function)
+            throws Exception {
+        function.hold(0, 11);
+        testHarness.processElement(new StreamRecord<>(0, 1L));
+        testHarness.processWatermark(new Watermark(1L));
+        testHarness.processElement(new StreamRecord<>(10, 2L));
+        runMails(testHarness);
+        testHarness.processElement(new StreamRecord<>(11, 3L));
+        testHarness.processElement(new StreamRecord<>(12, 4L));
+        runMails(testHarness);
+
+        TableAsyncExecutionController<Integer, Integer, Integer> controller =
+                ((TableKeyedAsyncWaitOperator<Integer, Integer, Integer>) testHarness.getOperator())
+                        .getAsyncExecutionController();
+        assertThat(controller.getFinishSize()).isOne();
+        assertThat(controller.getInFlightSize()).isEqualTo(2);
+        assertThat(controller.getBlockingSize()).isOne();
+        assertThat(testHarness.getOutput()).isEmpty();
+    }
+
+    private static void runMails(
+            KeyedOneInputStreamOperatorTestHarness<Integer, Integer, Integer> testHarness)
+            throws Exception {
+        while (testHarness.getTaskMailbox().hasMail()) {
+            for (Mail mail : testHarness.getTaskMailbox().drain()) {
+                mail.run();
+            }
+        }
+    }
+
+    private static List<Integer> recordValuesOfKey(Queue<Object> output, int key) {
+        return output.stream()
+                .filter(e -> e instanceof StreamRecord)
+                .map(e -> (Integer) ((StreamRecord<?>) e).getValue())
+                .filter(value -> value / 10 == key)
+                .collect(Collectors.toList());
+    }
+
+    private static KeyedOneInputStreamOperatorTestHarness<Integer, Integer, Integer>
+            createKeyedByTensTestHarness(AsyncFunction<Integer, Integer> function)
+                    throws Exception {
+        KeySelector<Integer, Integer> byTens = value -> value / 10;
+        return new KeyedOneInputStreamOperatorTestHarness<>(
+                new TableKeyedAsyncWaitOperatorFactory<>(function, byTens, 0L, 10),
+                byTens,
+                BasicTypeInfo.INT_TYPE_INFO,
+                IntSerializer.INSTANCE);
+    }
+
+    /**
+     * Completes a record in the calling thread, unless its value is held. Held records complete
+     * when they are released.
+     */
+    private static class ControlledAsyncFunction extends RichAsyncFunction<Integer, Integer> {
+
+        private static final long serialVersionUID = 1L;
+
+        private final transient Set<Integer> held = new HashSet<>();
+        private final transient Map<Integer, ResultFuture<Integer>> waiting = new HashMap<>();
+
+        void hold(Integer... values) {
+            held.addAll(Arrays.asList(values));
+        }
+
+        void releaseAll() {
+            held.clear();
+            waiting.forEach((value, future) -> future.complete(Collections.singletonList(value)));
+            waiting.clear();
+        }
+
+        @Override
+        public void asyncInvoke(Integer input, ResultFuture<Integer> resultFuture) {
+            if (held.contains(input)) {
+                waiting.put(input, resultFuture);
+            } else {
+                resultFuture.complete(Collections.singletonList(input));
             }
         }
     }
