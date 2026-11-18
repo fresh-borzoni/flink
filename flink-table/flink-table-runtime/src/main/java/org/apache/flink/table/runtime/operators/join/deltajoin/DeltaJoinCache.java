@@ -139,6 +139,22 @@ public class DeltaJoinCache {
         }
     }
 
+    /** Removes the row with the given upsert key from a cached key, if that key is cached. */
+    public void deleteCache(RowData key, RowData uk, boolean deleteRightCache) {
+        Cache<RowData, LinkedHashMap<RowData, RowData>> cache =
+                deleteRightCache ? rightCache : leftCache;
+        AtomicLong cacheTotalSize = deleteRightCache ? rightTotalSize : leftTotalSize;
+        cache.asMap()
+                .computeIfPresent(
+                        key,
+                        (k, v) -> {
+                            if (v.remove(uk) != null) {
+                                cacheTotalSize.decrementAndGet();
+                            }
+                            return v;
+                        });
+    }
+
     private void upsert(
             Cache<RowData, LinkedHashMap<RowData, RowData>> cache,
             RowData key,
