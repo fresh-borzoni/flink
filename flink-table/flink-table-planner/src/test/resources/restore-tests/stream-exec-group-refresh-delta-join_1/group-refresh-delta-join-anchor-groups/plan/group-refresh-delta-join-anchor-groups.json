@@ -1,0 +1,377 @@
+{
+  "flinkVersion" : "2.5",
+  "nodes" : [ {
+    "id" : 1,
+    "type" : "stream-exec-table-source-scan_2",
+    "scanTableSource" : {
+      "table" : {
+        "identifier" : "`default_catalog`.`default_database`.`orders`",
+        "resolvedTable" : {
+          "schema" : {
+            "columns" : [ {
+              "name" : "o_id",
+              "dataType" : "INT NOT NULL"
+            }, {
+              "name" : "o_cid",
+              "dataType" : "INT"
+            }, {
+              "name" : "o_amount",
+              "dataType" : "INT"
+            } ],
+            "primaryKey" : {
+              "name" : "PK_o_id",
+              "type" : "PRIMARY_KEY",
+              "columns" : [ "o_id" ]
+            },
+            "indexes" : [ {
+              "name" : "INDEX_o_id",
+              "columns" : [ "o_id" ]
+            }, {
+              "name" : "INDEX_o_cid",
+              "columns" : [ "o_cid" ]
+            } ]
+          }
+        }
+      }
+    },
+    "outputType" : "ROW<`o_id` INT NOT NULL, `o_cid` INT, `o_amount` INT>",
+    "description" : "TableSourceScan(table=[[default_catalog, default_database, orders]], fields=[o_id, o_cid, o_amount])"
+  }, {
+    "id" : 2,
+    "type" : "stream-exec-table-source-scan_2",
+    "scanTableSource" : {
+      "table" : {
+        "identifier" : "`default_catalog`.`default_database`.`customers`",
+        "resolvedTable" : {
+          "schema" : {
+            "columns" : [ {
+              "name" : "c_id",
+              "dataType" : "INT NOT NULL"
+            }, {
+              "name" : "c_name",
+              "dataType" : "VARCHAR(2147483647)"
+            } ],
+            "primaryKey" : {
+              "name" : "PK_c_id",
+              "type" : "PRIMARY_KEY",
+              "columns" : [ "c_id" ]
+            },
+            "indexes" : [ {
+              "name" : "INDEX_c_id",
+              "columns" : [ "c_id" ]
+            } ]
+          }
+        }
+      }
+    },
+    "outputType" : "ROW<`c_id` INT NOT NULL, `c_name` VARCHAR(2147483647)>",
+    "description" : "TableSourceScan(table=[[default_catalog, default_database, customers]], fields=[c_id, c_name])"
+  }, {
+    "id" : 3,
+    "type" : "stream-exec-group-refresh-delta-join_1",
+    "configuration" : {
+      "table.exec.async-lookup.buffer-capacity" : "100",
+      "table.exec.async-lookup.timeout" : "3 min",
+      "table.exec.delta-join.cache-enabled" : "true",
+      "table.exec.delta-join.group-refresh.max-group-size" : "1000000",
+      "table.exec.delta-join.group-refresh.output-cache-size" : "10000",
+      "table.exec.delta-join.group-refresh.page-size" : "10000",
+      "table.exec.delta-join.left.cache-size" : "10000",
+      "table.exec.delta-join.right.cache-size" : "10000"
+    },
+    "spec" : {
+      "leafTypes" : [ "ROW<`o_id` INT NOT NULL, `o_cid` INT, `o_amount` INT>", "ROW<`c_id` INT NOT NULL, `c_name` VARCHAR(2147483647)>" ],
+      "nodes" : [ {
+        "leaf" : 0,
+        "left" : -1,
+        "right" : -1,
+        "edge" : -1,
+        "outputLeaves" : [ 0, 0, 0 ],
+        "outputFields" : [ 0, 1, 2 ]
+      }, {
+        "leaf" : 1,
+        "left" : -1,
+        "right" : -1,
+        "edge" : -1,
+        "outputLeaves" : [ 1, 1 ],
+        "outputFields" : [ 0, 1 ]
+      }, {
+        "leaf" : -1,
+        "left" : 0,
+        "right" : 1,
+        "joinType" : "LEFT",
+        "edge" : 0,
+        "condition" : {
+          "kind" : "CALL",
+          "syntax" : "BINARY",
+          "internalName" : "$=$1",
+          "operands" : [ {
+            "kind" : "INPUT_REF",
+            "inputIndex" : 1,
+            "type" : "INT"
+          }, {
+            "kind" : "INPUT_REF",
+            "inputIndex" : 3,
+            "type" : "INT NOT NULL"
+          } ],
+          "type" : "BOOLEAN"
+        },
+        "leftType" : "ROW<`o_id` INT NOT NULL, `o_cid` INT, `o_amount` INT>",
+        "rightType" : "ROW<`c_id` INT NOT NULL, `c_name` VARCHAR(2147483647)>",
+        "outputLeaves" : [ 0, 0, 0, 1, 1 ],
+        "outputFields" : [ 0, 1, 2, 0, 1 ]
+      } ],
+      "edges" : [ {
+        "leftLeaf" : 0,
+        "leftFields" : [ 1 ],
+        "rightLeaf" : 1,
+        "rightFields" : [ 0 ],
+        "lookupRight" : {
+          "lookupTable" : {
+            "lookupTableSource" : {
+              "table" : {
+                "identifier" : "`default_catalog`.`default_database`.`customers`",
+                "resolvedTable" : {
+                  "schema" : {
+                    "columns" : [ {
+                      "name" : "c_id",
+                      "dataType" : "INT NOT NULL"
+                    }, {
+                      "name" : "c_name",
+                      "dataType" : "VARCHAR(2147483647)"
+                    } ],
+                    "primaryKey" : {
+                      "name" : "PK_c_id",
+                      "type" : "PRIMARY_KEY",
+                      "columns" : [ "c_id" ]
+                    },
+                    "indexes" : [ {
+                      "name" : "INDEX_c_id",
+                      "columns" : [ "c_id" ]
+                    } ]
+                  }
+                }
+              }
+            },
+            "outputType" : "ROW<`c_id` INT NOT NULL, `c_name` VARCHAR(2147483647)> NOT NULL"
+          },
+          "lookupKeys" : {
+            "0" : {
+              "type" : "FieldRef",
+              "index" : 1
+            }
+          },
+          "remainingCondition" : null
+        },
+        "lookupLeft" : {
+          "lookupTable" : {
+            "lookupTableSource" : {
+              "table" : {
+                "identifier" : "`default_catalog`.`default_database`.`orders`",
+                "resolvedTable" : {
+                  "schema" : {
+                    "columns" : [ {
+                      "name" : "o_id",
+                      "dataType" : "INT NOT NULL"
+                    }, {
+                      "name" : "o_cid",
+                      "dataType" : "INT"
+                    }, {
+                      "name" : "o_amount",
+                      "dataType" : "INT"
+                    } ],
+                    "primaryKey" : {
+                      "name" : "PK_o_id",
+                      "type" : "PRIMARY_KEY",
+                      "columns" : [ "o_id" ]
+                    },
+                    "indexes" : [ {
+                      "name" : "INDEX_o_id",
+                      "columns" : [ "o_id" ]
+                    }, {
+                      "name" : "INDEX_o_cid",
+                      "columns" : [ "o_cid" ]
+                    } ]
+                  }
+                }
+              }
+            },
+            "outputType" : "ROW<`o_id` INT NOT NULL, `o_cid` INT, `o_amount` INT> NOT NULL"
+          },
+          "lookupKeys" : {
+            "1" : {
+              "type" : "FieldRef",
+              "index" : 0
+            }
+          },
+          "remainingCondition" : null
+        }
+      } ],
+      "anchorLeaf" : 0,
+      "anchorKey" : [ 0 ],
+      "anchorLookup" : {
+        "lookupTable" : {
+          "lookupTableSource" : {
+            "table" : {
+              "identifier" : "`default_catalog`.`default_database`.`orders`",
+              "resolvedTable" : {
+                "schema" : {
+                  "columns" : [ {
+                    "name" : "o_id",
+                    "dataType" : "INT NOT NULL"
+                  }, {
+                    "name" : "o_cid",
+                    "dataType" : "INT"
+                  }, {
+                    "name" : "o_amount",
+                    "dataType" : "INT"
+                  } ],
+                  "primaryKey" : {
+                    "name" : "PK_o_id",
+                    "type" : "PRIMARY_KEY",
+                    "columns" : [ "o_id" ]
+                  },
+                  "indexes" : [ {
+                    "name" : "INDEX_o_id",
+                    "columns" : [ "o_id" ]
+                  }, {
+                    "name" : "INDEX_o_cid",
+                    "columns" : [ "o_cid" ]
+                  } ]
+                }
+              }
+            }
+          },
+          "outputType" : "ROW<`o_id` INT NOT NULL, `o_cid` INT, `o_amount` INT> NOT NULL"
+        },
+        "lookupKeys" : {
+          "0" : {
+            "type" : "FieldRef",
+            "index" : 0
+          }
+        },
+        "remainingCondition" : null
+      },
+      "leafKeys" : [ [ 0 ], [ 0 ] ],
+      "grouping" : "ANCHOR"
+    },
+    "outputMode" : "STATE",
+    "declaredKeys" : [ [ 0 ], [ 0, 3 ] ],
+    "inputProperties" : [ {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    }, {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    } ],
+    "outputType" : "ROW<`o_id` INT NOT NULL, `o_cid` INT, `o_amount` INT, `c_id` INT, `c_name` VARCHAR(2147483647)>",
+    "description" : "GroupRefreshDeltaJoin(joinTree=[#0 LeftOuterJoin #1], joinConditions=[=(o_cid, c_id)], groups=[anchor #0(o_id)], mode=[STATE], select=[o_id, o_cid, o_amount, c_id, c_name])",
+    "dropUpdateBefore" : true
+  }, {
+    "id" : 4,
+    "type" : "stream-exec-calc_1",
+    "projection" : [ {
+      "kind" : "INPUT_REF",
+      "inputIndex" : 0,
+      "type" : "INT NOT NULL"
+    }, {
+      "kind" : "INPUT_REF",
+      "inputIndex" : 4,
+      "type" : "VARCHAR(2147483647)"
+    }, {
+      "kind" : "INPUT_REF",
+      "inputIndex" : 2,
+      "type" : "INT"
+    } ],
+    "condition" : null,
+    "inputProperties" : [ {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    } ],
+    "outputType" : "ROW<`o_id` INT NOT NULL, `c_name` VARCHAR(2147483647), `o_amount` INT>",
+    "description" : "Calc(select=[o_id, c_name, o_amount])"
+  }, {
+    "id" : 5,
+    "type" : "stream-exec-sink_2",
+    "configuration" : {
+      "table.exec.sink.keyed-shuffle" : "AUTO",
+      "table.exec.sink.not-null-enforcer" : "ERROR",
+      "table.exec.sink.rowtime-inserter" : "ENABLED",
+      "table.exec.sink.type-length-enforcer" : "IGNORE",
+      "table.exec.sink.upsert-materialize" : "AUTO"
+    },
+    "dynamicTableSink" : {
+      "table" : {
+        "identifier" : "`default_catalog`.`default_database`.`snk`",
+        "resolvedTable" : {
+          "schema" : {
+            "columns" : [ {
+              "name" : "o_id",
+              "dataType" : "INT NOT NULL"
+            }, {
+              "name" : "c_name",
+              "dataType" : "VARCHAR(2147483647)"
+            }, {
+              "name" : "o_amount",
+              "dataType" : "INT"
+            } ],
+            "primaryKey" : {
+              "name" : "PK_o_id",
+              "type" : "PRIMARY_KEY",
+              "columns" : [ "o_id" ]
+            }
+          }
+        }
+      }
+    },
+    "inputChangelogMode" : [ "INSERT", "UPDATE_AFTER", "DELETE" ],
+    "inputUpsertKey" : [ 0 ],
+    "inputProperties" : [ {
+      "requiredDistribution" : {
+        "type" : "UNKNOWN"
+      },
+      "damBehavior" : "PIPELINED",
+      "priority" : 0
+    } ],
+    "outputType" : "ROW<`o_id` INT NOT NULL, `c_name` VARCHAR(2147483647), `o_amount` INT>",
+    "description" : "Sink(table=[default_catalog.default_database.snk], fields=[o_id, c_name, o_amount])"
+  } ],
+  "edges" : [ {
+    "source" : 1,
+    "target" : 3,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  }, {
+    "source" : 2,
+    "target" : 3,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  }, {
+    "source" : 3,
+    "target" : 4,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  }, {
+    "source" : 4,
+    "target" : 5,
+    "shuffle" : {
+      "type" : "FORWARD"
+    },
+    "shuffleMode" : "PIPELINED"
+  } ]
+}
