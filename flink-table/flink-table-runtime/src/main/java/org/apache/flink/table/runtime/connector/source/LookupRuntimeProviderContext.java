@@ -37,9 +37,17 @@ public final class LookupRuntimeProviderContext implements LookupTableSource.Loo
 
     private final boolean preferCustomShuffle;
 
+    private final boolean requiresReadYourWrites;
+
     public LookupRuntimeProviderContext(int[][] lookupKeys, boolean preferCustomShuffle) {
+        this(lookupKeys, preferCustomShuffle, false);
+    }
+
+    public LookupRuntimeProviderContext(
+            int[][] lookupKeys, boolean preferCustomShuffle, boolean requiresReadYourWrites) {
         this.lookupKeys = lookupKeys;
         this.preferCustomShuffle = preferCustomShuffle;
+        this.requiresReadYourWrites = requiresReadYourWrites;
     }
 
     @Override
@@ -50,6 +58,11 @@ public final class LookupRuntimeProviderContext implements LookupTableSource.Loo
     @Override
     public boolean preferCustomShuffle() {
         return preferCustomShuffle;
+    }
+
+    @Override
+    public boolean requiresReadYourWrites() {
+        return requiresReadYourWrites;
     }
 
     @Override

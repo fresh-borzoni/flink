@@ -106,6 +106,22 @@ public interface LookupTableSource extends DynamicTableSource {
          *     otherwise returns false
          */
         boolean preferCustomShuffle();
+
+        /**
+         * Whether the lookups must see the rows that the sink writer of the same task received
+         * before, see {@link
+         * org.apache.flink.table.connector.sink.abilities.SupportsReadYourWrites}. A source that
+         * finds no such writer when it looks up must fail instead of reading without it.
+         *
+         * <p>Such lookups are by columns of the primary key only, so a row that a pending write
+         * moves to another lookup key also changes its primary key, and the old row is deleted by a
+         * write of its own.
+         *
+         * @return true if the lookups read back what a sink of the same table wrote
+         */
+        default boolean requiresReadYourWrites() {
+            return false;
+        }
     }
 
     /**

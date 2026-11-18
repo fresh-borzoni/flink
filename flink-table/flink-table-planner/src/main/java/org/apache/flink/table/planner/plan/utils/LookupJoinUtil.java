@@ -334,6 +334,29 @@ public final class LookupJoinUtil extends FunctionCallUtil {
             boolean async,
             ResultRetryStrategy retryStrategy,
             boolean preferCustomShuffle) {
+        return getLookupFunction(
+                temporalTable,
+                lookupKeys,
+                classLoader,
+                async,
+                retryStrategy,
+                preferCustomShuffle,
+                false);
+    }
+
+    /**
+     * Like {@link #getLookupFunction(RelOptTable, Collection, ClassLoader, boolean,
+     * ResultRetryStrategy, boolean)}, for lookups that may have to read the writes of a sink in
+     * their task, see {@link LookupTableSource.LookupContext#requiresReadYourWrites()}.
+     */
+    public static UserDefinedFunction getLookupFunction(
+            RelOptTable temporalTable,
+            Collection<Integer> lookupKeys,
+            ClassLoader classLoader,
+            boolean async,
+            ResultRetryStrategy retryStrategy,
+            boolean preferCustomShuffle,
+            boolean requiresReadYourWrites) {
         UserDefinedFunction lookupFunction = null;
         int[] lookupKeyIndicesInOrder = getOrderedLookupKeys(lookupKeys);
         if (temporalTable instanceof TableSourceTable) {
@@ -344,7 +367,8 @@ public final class LookupJoinUtil extends FunctionCallUtil {
                             retryStrategy,
                             async,
                             classLoader,
-                            preferCustomShuffle);
+                            preferCustomShuffle,
+                            requiresReadYourWrites);
         } else if (temporalTable instanceof LegacyTableSourceTable) {
             lookupFunction =
                     findLookupFunctionFromLegacySource(
@@ -411,10 +435,14 @@ public final class LookupJoinUtil extends FunctionCallUtil {
             ResultRetryStrategy retryStrategy,
             boolean async,
             ClassLoader classLoader,
-            boolean preferCustomShuffle) {
+            boolean preferCustomShuffle,
+            boolean requiresReadYourWrites) {
         LookupTableSource.LookupRuntimeProvider provider =
                 createLookupRuntimeProvider(
-                        temporalTable, lookupKeyIndicesInOrder, preferCustomShuffle);
+                        temporalTable,
+                        lookupKeyIndicesInOrder,
+                        preferCustomShuffle,
+                        requiresReadYourWrites);
 
         if (async) {
             if (provider instanceof AsyncLookupFunctionProvider) {
@@ -506,6 +534,15 @@ public final class LookupJoinUtil extends FunctionCallUtil {
 
     private static LookupTableSource.LookupRuntimeProvider createLookupRuntimeProvider(
             RelOptTable temporalTable, int[] lookupKeyIndicesInOrder, boolean preferCustomShuffle) {
+        return createLookupRuntimeProvider(
+                temporalTable, lookupKeyIndicesInOrder, preferCustomShuffle, false);
+    }
+
+    private static LookupTableSource.LookupRuntimeProvider createLookupRuntimeProvider(
+            RelOptTable temporalTable,
+            int[] lookupKeyIndicesInOrder,
+            boolean preferCustomShuffle,
+            boolean requiresReadYourWrites) {
         // TODO: support nested lookup keys in the future,
         //  currently we only support top-level lookup keys
         int[][] indices =
@@ -516,7 +553,8 @@ public final class LookupJoinUtil extends FunctionCallUtil {
         LookupTableSource tableSource =
                 (LookupTableSource) ((TableSourceTable) temporalTable).tableSource();
         LookupRuntimeProviderContext providerContext =
-                new LookupRuntimeProviderContext(indices, preferCustomShuffle);
+                new LookupRuntimeProviderContext(
+                        indices, preferCustomShuffle, requiresReadYourWrites);
         return tableSource.getLookupRuntimeProvider(providerContext);
     }
 

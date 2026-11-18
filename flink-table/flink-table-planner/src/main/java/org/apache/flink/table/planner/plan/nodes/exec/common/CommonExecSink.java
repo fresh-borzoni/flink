@@ -58,6 +58,7 @@ import org.apache.flink.table.planner.connectors.DynamicSinkUtils;
 import org.apache.flink.table.planner.lineage.TableLineageUtils;
 import org.apache.flink.table.planner.lineage.TableSinkLineageVertex;
 import org.apache.flink.table.planner.lineage.TableSinkLineageVertexImpl;
+import org.apache.flink.table.planner.plan.abilities.sink.ReadYourWritesSpec;
 import org.apache.flink.table.planner.plan.abilities.sink.RowLevelDeleteSpec;
 import org.apache.flink.table.planner.plan.abilities.sink.RowLevelUpdateSpec;
 import org.apache.flink.table.planner.plan.abilities.sink.SinkAbilitySpec;
@@ -196,6 +197,27 @@ public abstract class CommonExecSink extends ExecNodeBase<Object>
         // compare every insert against the row stored under the same primary key
         final boolean needMaterialization =
                 upsertMaterialize && (!inputInsertOnly || detectsDuplicateKeys(conflictStrategy));
+
+        if (readsYourWrites()
+                && (needMaterialization
+                        || sinkParallelism != inputParallelism
+                        || config.get(ExecutionConfigOptions.TABLE_EXEC_SINK_KEYED_SHUFFLE)
+                                == ExecutionConfigOptions.SinkKeyedShuffle.FORCE)) {
+            throw new TableException(
+                    String.format(
+                            "The operator before the sink for table '%s' reads back the rows the "
+                                    + "sink receives, which needs the sink in its task, but the "
+                                    + "rows would be redistributed before the sink: the sink "
+                                    + "parallelism is %s, the input parallelism is %s, and upsert "
+                                    + "materialization is %s.",
+                            tableSinkSpec
+                                    .getContextResolvedTable()
+                                    .getIdentifier()
+                                    .asSummaryString(),
+                            sinkParallelism,
+                            inputParallelism,
+                            needMaterialization ? "on" : "off"));
+        }
 
         Transformation<RowData> sinkTransform =
                 applyConstraintValidations(
@@ -585,6 +607,13 @@ public abstract class CommonExecSink extends ExecNodeBase<Object>
         } else {
             return DynamicSinkUtils.createConsumedType(schema, sink);
         }
+    }
+
+    /** Whether the operator before the sink reads back the rows the sink receives. */
+    private boolean readsYourWrites() {
+        return tableSinkSpec.getSinkAbilities() != null
+                && tableSinkSpec.getSinkAbilities().stream()
+                        .anyMatch(spec -> spec instanceof ReadYourWritesSpec);
     }
 
     /**
