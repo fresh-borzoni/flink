@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.api.config;
 
+import org.apache.flink.annotation.Experimental;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.annotation.docs.Documentation;
 import org.apache.flink.configuration.ConfigOption;
@@ -400,6 +401,42 @@ public class OptimizerConfigOptions {
                     .withDescription(
                             "Strategy for optimizing the delta-join. Only AUTO, FORCE or NONE can be set. Default it AUTO.");
 
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<Boolean> TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_ENABLED =
+            key("table.optimizer.delta-join.group-refresh.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enables the group refresh delta join for joins the delta join cannot "
+                                    + "handle incrementally, e.g. outer joins or inputs with deletes.");
+
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<Boolean> TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_READ_BACK =
+            key("table.optimizer.delta-join.group-refresh.read-back")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether a group refresh delta join reads the rows it emitted back from "
+                                    + "its output table, which needs a sink that supports it. Set "
+                                    + "it to false to keep them in state instead, which is correct "
+                                    + "only if every sink discards the writes of a failed attempt, "
+                                    + "as exactly-once sinks do.");
+
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<DeltaJoinGrouping>
+            TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_GROUPING =
+                    key("table.optimizer.delta-join.group-refresh.grouping")
+                            .enumType(DeltaJoinGrouping.class)
+                            .defaultValue(DeltaJoinGrouping.AUTO)
+                            .withDescription(
+                                    "How a join of two tables that refreshes groups chooses its "
+                                            + "groups. A change re-reads its whole group, so "
+                                            + "small groups are cheap. A tree of three or more "
+                                            + "tables is always grouped by an anchor.");
+
     /** Strategy for handling non-deterministic updates. */
     @PublicEvolving
     public enum NonDeterministicUpdateStrategy {
@@ -467,6 +504,37 @@ public class OptimizerConfigOptions {
         @Override
         public String toString() {
             return value;
+        }
+
+        @Override
+        public InlineElement getDescription() {
+            return description;
+        }
+    }
+
+    /** How a join of two tables that refreshes groups chooses its groups. */
+    @Experimental
+    public enum DeltaJoinGrouping implements DescribedEnum {
+        AUTO(
+                text(
+                        "Groups by an anchor if one table is in every output row, otherwise by "
+                                + "the join key. If the output table can be read back by the join "
+                                + "key but its rows are not keyed by the anchor, groups by the "
+                                + "join key.")),
+        JOIN_KEY(
+                text(
+                        "Groups by the join key: a change re-reads all rows of its join key in "
+                                + "both tables.")),
+        ANCHOR(
+                text(
+                        "Groups by an anchor, a table that is in every output row: a change "
+                                + "re-reads the output rows of the anchor rows it affects. A FULL "
+                                + "join has no anchor and is not converted."));
+
+        private final InlineElement description;
+
+        DeltaJoinGrouping(InlineElement description) {
+            this.description = description;
         }
 
         @Override

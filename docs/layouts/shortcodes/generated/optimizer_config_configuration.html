@@ -30,6 +30,24 @@ ONE_PHASE: Enforce to use one stage aggregate which only has CompleteGlobalAggre
             <td>The maximum number of joined nodes allowed in the bushy join reorder algorithm, otherwise the left-deep join reorder algorithm will be used. The search space of bushy join reorder algorithm will increase with the increase of this threshold value, so this threshold is not recommended to be set too large. The default value is 12.</td>
         </tr>
         <tr>
+            <td><h5>table.optimizer.delta-join.group-refresh.enabled</h5><br> <span class="label label-primary">Streaming</span></td>
+            <td style="word-wrap: break-word;">false</td>
+            <td>Boolean</td>
+            <td>Enables the group refresh delta join for joins the delta join cannot handle incrementally, e.g. outer joins or inputs with deletes.</td>
+        </tr>
+        <tr>
+            <td><h5>table.optimizer.delta-join.group-refresh.grouping</h5><br> <span class="label label-primary">Streaming</span></td>
+            <td style="word-wrap: break-word;">AUTO</td>
+            <td><p>Enum</p></td>
+            <td>How a join of two tables that refreshes groups chooses its groups. A change re-reads its whole group, so small groups are cheap. A tree of three or more tables is always grouped by an anchor.<br /><br />Possible values:<ul><li>"AUTO": Groups by an anchor if one table is in every output row, otherwise by the join key. If the output table can be read back by the join key but its rows are not keyed by the anchor, groups by the join key.</li><li>"JOIN_KEY": Groups by the join key: a change re-reads all rows of its join key in both tables.</li><li>"ANCHOR": Groups by an anchor, a table that is in every output row: a change re-reads the output rows of the anchor rows it affects. A FULL join has no anchor and is not converted.</li></ul></td>
+        </tr>
+        <tr>
+            <td><h5>table.optimizer.delta-join.group-refresh.read-back</h5><br> <span class="label label-primary">Streaming</span></td>
+            <td style="word-wrap: break-word;">true</td>
+            <td>Boolean</td>
+            <td>Whether a group refresh delta join reads the rows it emitted back from its output table, which needs a sink that supports it. Set it to false to keep them in state instead, which is correct only if every sink discards the writes of a failed attempt, as exactly-once sinks do.</td>
+        </tr>
+        <tr>
             <td><h5>table.optimizer.delta-join.strategy</h5><br> <span class="label label-primary">Streaming</span></td>
             <td style="word-wrap: break-word;">AUTO</td>
             <td><p>Enum</p></td>

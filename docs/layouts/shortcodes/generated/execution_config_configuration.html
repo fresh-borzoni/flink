@@ -157,6 +157,24 @@ ORDERED means that the operator emits the result in the same order as the data e
             <td>Whether to enable the cache of delta join. If enabled, the delta join caches the records from remote dim table. Default is true.</td>
         </tr>
         <tr>
+            <td><h5>table.exec.delta-join.group-refresh.max-group-size</h5><br> <span class="label label-primary">Streaming</span></td>
+            <td style="word-wrap: break-word;">1000000</td>
+            <td>Integer</td>
+            <td>Maximum number of rows of a group that is refreshed without paging. A larger group fails the job.</td>
+        </tr>
+        <tr>
+            <td><h5>table.exec.delta-join.group-refresh.output-cache-size</h5><br> <span class="label label-primary">Streaming</span></td>
+            <td style="word-wrap: break-word;">10000</td>
+            <td>Integer</td>
+            <td>The number of groups whose emitted rows a delta join that refreshes groups keeps in memory when it reads its output table back. Other groups are read back.</td>
+        </tr>
+        <tr>
+            <td><h5>table.exec.delta-join.group-refresh.page-size</h5><br> <span class="label label-primary">Streaming</span></td>
+            <td style="word-wrap: break-word;">10000</td>
+            <td>Integer</td>
+            <td>A group with more rows than this is refreshed in pages, if the lookups of its tables support pages. Must be positive.</td>
+        </tr>
+        <tr>
             <td><h5>table.exec.delta-join.left.cache-size</h5><br> <span class="label label-primary">Streaming</span></td>
             <td style="word-wrap: break-word;">10000</td>
             <td>Long</td>

@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.api.config;
 
+import org.apache.flink.annotation.Experimental;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.annotation.docs.Documentation;
@@ -912,6 +913,38 @@ public class ExecutionConfigOptions {
                     .withDescription(
                             "The cache size used to cache the lookup results of the right table in delta join. "
                                     + "This value must be positive when enabling cache. Default is 10000.");
+
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<Integer>
+            TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_OUTPUT_CACHE_SIZE =
+                    key("table.exec.delta-join.group-refresh.output-cache-size")
+                            .intType()
+                            .defaultValue(10000)
+                            .withDescription(
+                                    "The number of groups whose emitted rows a delta join that "
+                                            + "refreshes groups keeps in memory when it reads its "
+                                            + "output table back. Other groups are read back.");
+
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<Integer> TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_MAX_GROUP_SIZE =
+            key("table.exec.delta-join.group-refresh.max-group-size")
+                    .intType()
+                    .defaultValue(1_000_000)
+                    .withDescription(
+                            "Maximum number of rows of a group that is refreshed without paging. A "
+                                    + "larger group fails the job.");
+
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<Integer> TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_PAGE_SIZE =
+            key("table.exec.delta-join.group-refresh.page-size")
+                    .intType()
+                    .defaultValue(10_000)
+                    .withDescription(
+                            "A group with more rows than this is refreshed in pages, if the "
+                                    + "lookups of its tables support pages. Must be positive.");
 
     // ------------------------------------------------------------------------------------------
     // Enum option types
