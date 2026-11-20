@@ -920,11 +920,26 @@ public class ExecutionConfigOptions {
             TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_OUTPUT_CACHE_SIZE =
                     key("table.exec.delta-join.group-refresh.output-cache-size")
                             .intType()
-                            .defaultValue(10000)
+                            .defaultValue(100_000)
                             .withDescription(
-                                    "The number of groups whose emitted rows a delta join that "
-                                            + "refreshes groups keeps in memory when it reads its "
-                                            + "output table back. Other groups are read back.");
+                                    "The number of emitted rows that a delta join that refreshes "
+                                            + "groups keeps in memory when it reads its output "
+                                            + "table back, counting the rows of the most recently "
+                                            + "written groups. Other groups are read back.");
+
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<Integer> TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_MAX_PINNED_ROWS =
+            key("table.exec.delta-join.group-refresh.max-pinned-rows")
+                    .intType()
+                    .defaultValue(200_000)
+                    .withDescription(
+                            "The number of emitted rows that a delta join that refreshes "
+                                    + "groups may keep in memory until a checkpoint makes "
+                                    + "them readable in its output table. Beyond it, the "
+                                    + "join starts no refresh until a checkpoint completes, "
+                                    + "and changed groups wait in state. Not used when the "
+                                    + "sink makes its rows readable at once.");
 
     @Experimental
     @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)

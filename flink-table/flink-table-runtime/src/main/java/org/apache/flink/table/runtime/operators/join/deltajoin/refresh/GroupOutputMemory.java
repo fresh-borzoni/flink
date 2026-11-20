@@ -100,6 +100,19 @@ interface GroupOutputMemory {
     default void forget(RowData key) {}
 
     /**
+     * Whether the memory holds as many rows as it may hold before checkpoints release some: no
+     * further group should be refreshed until then.
+     */
+    default boolean full() {
+        return false;
+    }
+
+    /** The rows held until a checkpoint completes. */
+    default long pinnedRows() {
+        return 0;
+    }
+
+    /**
      * A checkpoint barrier passed the operator: every row emitted so far precedes it. If the
      * barrier is aligned, it overtakes no row on the way to the sink.
      */
@@ -295,19 +308,23 @@ interface GroupOutputMemory {
      * memory until an aligned checkpoint completes whose barrier passed after its last write, since
      * the sink makes the rows visible by then.
      *
+     * <p>Both limits count rows, not groups. Groups that may be read back are kept up to {@code
+     * maxCachedRows}, least recently used first out, and a group larger than that is not kept at
+     * all. Pinned groups cannot be dropped: once they hold more than {@code maxPinnedRows}, the
+     * memory is {@link #full()} and the operator starts no refresh until a checkpoint releases
+     * them.
+     *
      * <p>After a restore every group is read back. A write of the failed attempt that lands later
      * is corrected only when its group changes again.
      */
     final class PinnedCacheMemory implements GroupOutputMemory {
 
-        /** Groups with more rows are not kept in memory when they can be read back any time. */
-        static final int MAX_CACHED_GROUP_ROWS = 10_000;
-
         private final GroupLookup outputLookup;
         private final @Nullable GroupLookup rowLookup;
         private final RowDataSerializer serializer;
         private final RowDataKeySelector outputKey;
-        private final int maxUnpinned;
+        private final long maxCachedRows;
+        private final long maxPinnedRows;
         private final boolean readYourWrites;
 
         /** Access order, eldest first. */
@@ -317,14 +334,16 @@ interface GroupOutputMemory {
         private final TreeSet<Long> alignedBarriers = new TreeSet<>();
 
         private long lastBarrier;
-        private int unpinned;
+        private long pinnedRows;
+        private long unpinnedRows;
         private long readBacks;
 
         PinnedCacheMemory(
                 GroupLookup outputLookup,
                 RowDataSerializer serializer,
                 RowDataKeySelector outputKey,
-                int maxUnpinned,
+                long maxCachedRows,
+                long maxPinnedRows,
                 long restoredCheckpointId,
                 boolean readYourWrites,
                 @Nullable GroupLookup rowLookup) {
@@ -332,7 +351,8 @@ interface GroupOutputMemory {
             this.rowLookup = rowLookup;
             this.serializer = serializer;
             this.outputKey = outputKey;
-            this.maxUnpinned = maxUnpinned;
+            this.maxCachedRows = maxCachedRows;
+            this.maxPinnedRows = maxPinnedRows;
             this.lastBarrier = restoredCheckpointId;
             this.readYourWrites = readYourWrites;
         }
@@ -431,10 +451,17 @@ interface GroupOutputMemory {
 
         @Override
         public void forget(RowData key) {
-            Entry dropped = cache.remove(key);
-            if (dropped != null && !dropped.pinned()) {
-                unpinned--;
-            }
+            release(cache.remove(key));
+        }
+
+        @Override
+        public boolean full() {
+            return pinnedRows > maxPinnedRows;
+        }
+
+        @Override
+        public long pinnedRows() {
+            return pinnedRows;
         }
 
         /**
@@ -517,22 +544,29 @@ interface GroupOutputMemory {
 
         @Override
         public void written(RowData key, Map<RowData, BinaryRowData> rows) {
-            if (readYourWrites && rows.size() > MAX_CACHED_GROUP_ROWS) {
+            release(cache.remove(key));
+            if (readYourWrites && rows.size() > maxCachedRows) {
                 // too large to remember; it is read back, row by row or whole, when needed
-                Entry dropped = cache.remove(key);
-                if (dropped != null && !dropped.pinned()) {
-                    unpinned--;
-                }
                 return;
             }
             Entry entry = new Entry(rows, readYourWrites ? Long.MIN_VALUE : lastBarrier);
-            Entry previous = cache.put(key, entry);
-            if (previous != null && !previous.pinned()) {
-                unpinned--;
-            }
-            if (!entry.pinned()) {
-                unpinned++;
+            cache.put(key, entry);
+            if (entry.pinned()) {
+                pinnedRows += entry.rows.size();
+            } else {
+                unpinnedRows += entry.rows.size();
                 evictUnpinned();
+            }
+        }
+
+        private void release(@Nullable Entry entry) {
+            if (entry == null) {
+                return;
+            }
+            if (entry.pinned()) {
+                pinnedRows -= entry.rows.size();
+            } else {
+                unpinnedRows -= entry.rows.size();
             }
         }
 
@@ -558,10 +592,18 @@ interface GroupOutputMemory {
             if (!known) {
                 return;
             }
-            for (Entry entry : cache.values()) {
+            Iterator<Entry> it = cache.values().iterator();
+            while (it.hasNext()) {
+                Entry entry = it.next();
                 if (entry.pinned() && entry.lastBarrierBeforeWrite < checkpointId) {
-                    entry.lastBarrierBeforeWrite = Long.MIN_VALUE;
-                    unpinned++;
+                    pinnedRows -= entry.rows.size();
+                    if (entry.rows.size() > maxCachedRows) {
+                        // it can be read back now, and is too large to keep
+                        it.remove();
+                    } else {
+                        entry.lastBarrierBeforeWrite = Long.MIN_VALUE;
+                        unpinnedRows += entry.rows.size();
+                    }
                 }
             }
             evictUnpinned();
@@ -570,10 +612,11 @@ interface GroupOutputMemory {
         /** Drops the least recently used unpinned groups beyond the limit. */
         private void evictUnpinned() {
             Iterator<Entry> it = cache.values().iterator();
-            while (unpinned > maxUnpinned && it.hasNext()) {
-                if (!it.next().pinned()) {
+            while (unpinnedRows > maxCachedRows && it.hasNext()) {
+                Entry entry = it.next();
+                if (!entry.pinned()) {
                     it.remove();
-                    unpinned--;
+                    unpinnedRows -= entry.rows.size();
                 }
             }
         }

@@ -58,12 +58,12 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -112,7 +112,18 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
     /** Keys whose pending flag is in state; cleared when their work is done. */
     private transient Set<RowData> persistedPending;
 
-    private transient List<RowData> restoredPending;
+    /**
+     * Whether keys may wait in state only: their pending flag is set, but the scheduler does not
+     * know them. They are restored keys, or keys that changed while no refresh could start and the
+     * scheduler held as many waiting keys as it may.
+     */
+    private transient boolean deferred;
+
+    private transient boolean pullScheduled;
+
+    /** The input ended: every group is refreshed, whatever the memory holds. */
+    private transient boolean ending;
+
     private transient Map<RowData, Integer> inconsistentRefreshes;
 
     /** Keys whose next refresh must read the whole group: restored, or read inconsistently. */
@@ -137,6 +148,8 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
     private transient long inconsistentGroups;
     private transient long rowsEmitted;
     private transient long pagedRefreshes;
+    private transient long deferredKeys;
+    private transient long startsWhileFull;
 
     protected GroupRefreshOperatorBase(
             StreamOperatorParameters<RowData> parameters, GroupRefreshSpec spec) {
@@ -281,14 +294,8 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
                                     new ValueStateDescriptor<>(
                                             EMITTED_STATE_NAME, BooleanSerializer.INSTANCE));
         }
-        restoredPending = new ArrayList<>();
-        if (restored) {
-            try (Stream<Object> keys =
-                    getKeyedStateBackend().getKeys(PENDING_STATE_NAME, VoidNamespace.INSTANCE)) {
-                restoredPending.addAll(
-                        keys.map(GroupRefreshOperatorBase::copyKey).collect(Collectors.toList()));
-            }
-        }
+        // restored keys stay in state and are pulled in batches, see pullDeferred
+        deferred = restored;
     }
 
     @Override
@@ -321,7 +328,8 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
                                 spec.outputLookup,
                                 outputSerializer,
                                 spec.outputKey.copy(),
-                                spec.maxUnpinnedGroups,
+                                spec.maxCachedRows,
+                                spec.maxPinnedRows,
                                 restoredCheckpointId,
                                 spec.readYourWrites,
                                 spec.outputRowLookup);
@@ -345,6 +353,8 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
         openGroupReader();
 
         scheduler = new RefreshScheduler<>(spec.capacity, this::startRefresh, this::emitWatermark);
+        // rows waiting in memory for a checkpoint are bounded: a refresh adds more
+        scheduler.setGate(() -> ending || memory == null || !memory.full());
         MetricGroup metrics = getRuntimeContext().getMetricGroup();
         metrics.gauge("numRefreshes", () -> refreshes);
         metrics.gauge("numWholeGroupRefreshes", () -> wholeRefreshes);
@@ -358,19 +368,12 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
         metrics.gauge("numKeysRefreshing", () -> scheduler.numRunning());
         metrics.gauge("numKeysWaiting", () -> scheduler.numWaiting());
         metrics.gauge("numCoalescedChanges", () -> scheduler.numCoalesced());
+        metrics.gauge("numDeferredKeys", () -> deferredKeys);
+        metrics.gauge("numPinnedRows", () -> memory == null ? 0L : memory.pinnedRows());
 
-        if (!restoredPending.isEmpty()) {
-            LOG.info(
-                    "Group refresh delta join restores {} keys with refreshes in flight.",
-                    restoredPending.size());
+        if (deferred) {
+            schedulePull();
         }
-        // they wait for free slots like new keys
-        for (RowData key : restoredPending) {
-            persistedPending.add(key);
-            wholeNext.add(key);
-            scheduler.note(key);
-        }
-        restoredPending = null;
         LOG.info(
                 "{} is active (output mode {}, capacity {}).",
                 getClass().getSimpleName(),
@@ -384,12 +387,91 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
 
     /**
      * The group of the given key may have changed. Blocks the input while too many keys wait for a
-     * refresh.
+     * refresh that can start.
+     *
+     * <p>While no refresh can start before a checkpoint completes, blocking would hold back the
+     * barrier of that checkpoint. Then keys beyond the limit wait in state instead.
      */
-    protected void requestRefresh(RowData key) throws InterruptedException {
-        scheduler.note(copyKey(key));
-        while (scheduler.numWaiting() > spec.maxWaitingKeys) {
+    protected void requestRefresh(RowData key) throws Exception {
+        if (scheduler.isGateClosed()
+                && scheduler.numWaiting() >= spec.maxWaitingKeys
+                && !scheduler.keysWithWork().contains(key)) {
+            defer(key);
+            return;
+        }
+        RowData copy = copyKey(key);
+        if (deferred && !scheduler.keysWithWork().contains(copy) && waitsInState(copy)) {
+            // what changed before is not in its scope: restored, or dropped by defer
+            persistedPending.add(copy);
+            wholeNext.add(copy);
+        }
+        scheduler.note(copy);
+        while (scheduler.numWaiting() > spec.maxWaitingKeys && !scheduler.isGateClosed()) {
             mailboxExecutor.yield();
+        }
+    }
+
+    /** Lets a key wait in state only; its next refresh reads the whole group. */
+    private void defer(RowData key) throws Exception {
+        discardScope(key);
+        Object current = getCurrentKey();
+        setCurrentKey(key);
+        if (pendingState.value() == null) {
+            pendingState.update(true);
+            deferredKeys++;
+        }
+        setCurrentKey(current);
+        deferred = true;
+    }
+
+    private boolean waitsInState(RowData key) throws Exception {
+        Object current = getCurrentKey();
+        setCurrentKey(key);
+        boolean pending = pendingState.value() != null;
+        setCurrentKey(current);
+        return pending;
+    }
+
+    private void schedulePull() {
+        if (!pullScheduled) {
+            pullScheduled = true;
+            mailboxExecutor.execute(this::pullDeferred, "Pull deferred group refreshes");
+        }
+    }
+
+    /**
+     * Hands keys that wait in state to the scheduler, as many as may wait there. Scans all pending
+     * flags, so it runs only once the scheduler has no waiting keys left.
+     */
+    private void pullDeferred() throws Exception {
+        pullScheduled = false;
+        int room = spec.maxWaitingKeys - scheduler.numWaiting();
+        if (!deferred || room <= 0 || (!ending && scheduler.isGateClosed())) {
+            return;
+        }
+        List<RowData> batch = new ArrayList<>();
+        boolean more = false;
+        try (Stream<Object> keys =
+                getKeyedStateBackend().getKeys(PENDING_STATE_NAME, VoidNamespace.INSTANCE)) {
+            Iterator<Object> it = keys.iterator();
+            while (it.hasNext()) {
+                RowData key = copyKey(it.next());
+                if (scheduler.keysWithWork().contains(key)) {
+                    // its flag is cleared once its work is done
+                    persistedPending.add(key);
+                } else if (batch.size() < room) {
+                    batch.add(key);
+                } else {
+                    more = true;
+                    break;
+                }
+            }
+        }
+        deferred = more;
+        for (RowData key : batch) {
+            persistedPending.add(key);
+            wholeNext.add(key);
+            scheduler.note(key);
         }
     }
 
@@ -428,9 +510,16 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
      * Blocks until every group with work was refreshed. Subclasses call it when all their inputs
      * ended, which precedes {@link #finish()}.
      */
-    protected void waitUntilIdle() throws InterruptedException {
-        while (!scheduler.isIdle()) {
-            mailboxExecutor.yield();
+    protected void waitUntilIdle() throws Exception {
+        // no checkpoint may complete before the input ends, so the memory may grow until then
+        ending = true;
+        scheduler.gateOpened();
+        while (deferred || !scheduler.isIdle()) {
+            if (deferred && scheduler.numWaiting() < spec.maxWaitingKeys) {
+                pullDeferred();
+            } else {
+                mailboxExecutor.yield();
+            }
         }
     }
 
@@ -440,6 +529,9 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
 
     private void startRefresh(RowData key) {
         refreshes++;
+        if (!ending && memory != null && memory.full()) {
+            startsWhileFull++;
+        }
         try {
             setCurrentKey(key);
             if (wholeNext.remove(key)) {
@@ -595,9 +687,14 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
     private void finishRefresh(RowData key) {
         // may start the refreshes of other keys, which changes the current key
         scheduler.finished(key);
-        if (!scheduler.keysWithWork().contains(key) && persistedPending.remove(key)) {
+        if (!scheduler.keysWithWork().contains(key)
+                // a deferred key may have been noted again before it was pulled
+                && (persistedPending.remove(key) || deferred)) {
             setCurrentKey(key);
             pendingState.clear();
+        }
+        if (deferred && scheduler.numWaiting() == 0) {
+            schedulePull();
         }
     }
 
@@ -702,6 +799,16 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
         super.notifyCheckpointComplete(checkpointId);
         if (memory != null) {
             memory.notifyCheckpointComplete(checkpointId);
+            // in the task thread, after this call: starting a refresh changes the current key
+            mailboxExecutor.execute(
+                    () -> {
+                        scheduler.gateOpened();
+                        if (deferred && scheduler.numWaiting() == 0) {
+                            schedulePull();
+                        }
+                    },
+                    "Start group refreshes after checkpoint %s",
+                    checkpointId);
         }
     }
 
@@ -756,6 +863,27 @@ public abstract class GroupRefreshOperatorBase extends AbstractStreamOperator<Ro
     @VisibleForTesting
     public long getRefreshes() {
         return refreshes;
+    }
+
+    /** Refreshes that started while the memory was full; always 0 unless the input ended. */
+    @VisibleForTesting
+    public long getStartsWhileFull() {
+        return startsWhileFull;
+    }
+
+    @VisibleForTesting
+    public boolean hasDeferredKeys() {
+        return deferred;
+    }
+
+    @VisibleForTesting
+    public long getDeferredKeys() {
+        return deferredKeys;
+    }
+
+    @VisibleForTesting
+    public long getPinnedRows() {
+        return memory == null ? 0 : memory.pinnedRows();
     }
 
     @VisibleForTesting

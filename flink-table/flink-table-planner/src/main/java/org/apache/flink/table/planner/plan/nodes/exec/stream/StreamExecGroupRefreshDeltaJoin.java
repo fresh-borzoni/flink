@@ -124,6 +124,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
             "table.exec.delta-join.left.cache-size",
             "table.exec.delta-join.right.cache-size",
             "table.exec.delta-join.group-refresh.output-cache-size",
+            "table.exec.delta-join.group-refresh.max-pinned-rows",
             "table.exec.delta-join.group-refresh.max-group-size",
             "table.exec.delta-join.group-refresh.page-size"
         },
@@ -539,10 +540,14 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
                         .declaredKeys(declaredKeys)
                         .groupKeyType(groupKeyType)
                         .capacity(capacity, 10 * capacity)
-                        .maxUnpinnedGroups(
+                        .maxCachedRows(
                                 config.get(
                                         ExecutionConfigOptions
                                                 .TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_OUTPUT_CACHE_SIZE))
+                        .maxPinnedRows(
+                                config.get(
+                                        ExecutionConfigOptions
+                                                .TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_MAX_PINNED_ROWS))
                         .lookupTimeoutMs(
                                 config.get(ExecutionConfigOptions.TABLE_EXEC_ASYNC_LOOKUP_TIMEOUT)
                                         .toMillis())

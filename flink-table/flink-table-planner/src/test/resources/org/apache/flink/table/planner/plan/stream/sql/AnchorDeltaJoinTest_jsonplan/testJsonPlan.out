@@ -181,7 +181,8 @@
       "table.exec.async-lookup.timeout" : "3 min",
       "table.exec.delta-join.cache-enabled" : "true",
       "table.exec.delta-join.group-refresh.max-group-size" : "1000000",
-      "table.exec.delta-join.group-refresh.output-cache-size" : "10000",
+      "table.exec.delta-join.group-refresh.max-pinned-rows" : "200000",
+      "table.exec.delta-join.group-refresh.output-cache-size" : "100000",
       "table.exec.delta-join.group-refresh.page-size" : "10000",
       "table.exec.delta-join.left.cache-size" : "10000",
       "table.exec.delta-join.right.cache-size" : "10000"

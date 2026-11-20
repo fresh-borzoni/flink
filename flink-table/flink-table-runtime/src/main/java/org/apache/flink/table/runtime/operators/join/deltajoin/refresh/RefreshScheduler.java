@@ -21,14 +21,13 @@ package org.apache.flink.table.runtime.operators.join.deltajoin.refresh;
 import org.apache.flink.util.Preconditions;
 
 import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 /**
@@ -41,6 +40,7 @@ import java.util.function.Consumer;
  *       otherwise the key waits. A key waits at most once, however many changes it receives.
  *   <li>A change for a running key marks it dirty. When the refresh ends, a dirty key is refreshed
  *       again: that refresh starts after the change arrived, so it reads the change.
+ *   <li>No refresh starts while the gate set by {@link #setGate} is closed.
  *   <li>A watermark is held back until every key that had work when the watermark arrived has
  *       finished a refresh that started after its last change before the watermark.
  * </ul>
@@ -68,6 +68,9 @@ public final class RefreshScheduler<K, W> {
     private int running;
     private long coalesced;
 
+    /** While closed, running refreshes end but no refresh starts. */
+    private BooleanSupplier gate = () -> true;
+
     public RefreshScheduler(int capacity, Consumer<K> startRefresh, Consumer<W> emitWatermark) {
         Preconditions.checkArgument(capacity > 0, "capacity must be positive");
         this.capacity = capacity;
@@ -81,7 +84,7 @@ public final class RefreshScheduler<K, W> {
         if (state == null) {
             state = new KeyState();
             keys.put(key, state);
-            if (running < capacity) {
+            if (running < capacity && gate.getAsBoolean()) {
                 start(key, state);
             } else {
                 waiting.add(key);
@@ -130,6 +133,24 @@ public final class RefreshScheduler<K, W> {
         emitReleasedWatermarks();
     }
 
+    /**
+     * Sets what must hold for a refresh to start. While it does not, running refreshes still end
+     * and changes still mark keys, but keys only wait. Call {@link #gateOpened()} when it may hold
+     * again.
+     */
+    public void setGate(BooleanSupplier gate) {
+        this.gate = gate;
+    }
+
+    /** The gate may hold again: starts as many waiting refreshes as there are free slots. */
+    public void gateOpened() {
+        startWaiting();
+    }
+
+    public boolean isGateClosed() {
+        return !gate.getAsBoolean();
+    }
+
     /** Keys that have work: running, dirty or waiting. */
     public Set<K> keysWithWork() {
         return keys.keySet();
@@ -160,14 +181,13 @@ public final class RefreshScheduler<K, W> {
     }
 
     private void startWaiting() {
+        // one at a time: a refresh that ends at once may close the gate
         Iterator<K> it = waiting.iterator();
-        List<K> toStart = new ArrayList<>();
-        while (running + toStart.size() < capacity && it.hasNext()) {
-            toStart.add(it.next());
+        while (running < capacity && it.hasNext() && gate.getAsBoolean()) {
+            K key = it.next();
             it.remove();
-        }
-        for (K key : toStart) {
             start(key, keys.get(key));
+            it = waiting.iterator();
         }
     }
 

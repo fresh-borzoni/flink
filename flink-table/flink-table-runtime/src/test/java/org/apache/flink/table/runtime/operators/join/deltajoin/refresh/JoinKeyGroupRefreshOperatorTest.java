@@ -140,6 +140,61 @@ class JoinKeyGroupRefreshOperatorTest {
     }
 
     /**
+     * Reading back after checkpoints with a budget of at most two pinned rows and room for at most
+     * two waiting keys: refreshes stop until checkpoints release rows, and keys beyond the room
+     * wait in state.
+     */
+    @Test
+    void testConvergesReadingBackWithinPinnedBudget() throws Exception {
+        assertConvergesWithinBudget(600, false);
+    }
+
+    @Test
+    void testConvergesReadingBackWithinPinnedBudgetWithFailures() throws Exception {
+        assertConvergesWithinBudget(600, true);
+    }
+
+    private void assertConvergesWithinBudget(int runs, boolean failures) throws Exception {
+        List<String> wrong = new ArrayList<>();
+        long deferred = 0;
+        for (int seed = 0; seed < runs; seed++) {
+            FlinkJoinType joinType = JOIN_TYPES[seed % JOIN_TYPES.length];
+            Run run =
+                    new Run(
+                            new Random(seed),
+                            joinType,
+                            GroupRefreshOutputMode.READ_BACK,
+                            seed % 2 == 0,
+                            true,
+                            true,
+                            failures,
+                            false,
+                            false);
+            run.budget = true;
+            run.execute();
+            deferred += run.deferredKeys;
+            if (run.startsWhileFull > 0) {
+                wrong.add(
+                        String.format(
+                                "seed %d (%s): %d refreshes started over the budget",
+                                seed, joinType, run.startsWhileFull));
+            }
+            Map<List<Object>, List<Object>> expected = run.expected();
+            if (!expected.equals(run.sink)) {
+                wrong.add(
+                        String.format(
+                                "seed %d (%s): expected %s but sink has %s",
+                                seed,
+                                joinType,
+                                new TreeMap<>(stringKeys(expected)),
+                                new TreeMap<>(stringKeys(run.sink))));
+            }
+        }
+        assertThat(wrong).as("runs that differ from the join or exceed the budget").isEmpty();
+        assertThat(deferred).as("keys that waited in state").isPositive();
+    }
+
+    /**
      * The sink makes every row visible to the lookups that the operator issues after emitting it,
      * so groups are read back at any time, and no checkpoint is needed.
      */
@@ -172,6 +227,42 @@ class JoinKeyGroupRefreshOperatorTest {
     void testConvergesRefreshingChangedChildren() throws Exception {
         // no input cache: parent lookups may read changes that were not emitted yet
         assertConverges(600, GroupRefreshOutputMode.STATE, false, true, false, false, false, true);
+    }
+
+    /**
+     * Restored keys wait in state until the operator pulls them. A change of such a key that
+     * arrives first must refresh its whole group, as its earlier changes are not in its scope.
+     */
+    @Test
+    void testRestoredKeysChangedBeforeTheyArePulledRefreshWholeGroups() throws Exception {
+        List<String> wrong = new ArrayList<>();
+        for (int seed = 0; seed < 600; seed++) {
+            FlinkJoinType joinType = JOIN_TYPES[seed % JOIN_TYPES.length];
+            Run run =
+                    new Run(
+                            new Random(seed),
+                            joinType,
+                            GroupRefreshOutputMode.READ_BACK,
+                            false,
+                            true,
+                            true,
+                            true,
+                            true,
+                            true);
+            run.inputFirstAfterRestore = true;
+            run.execute();
+            Map<List<Object>, List<Object>> expected = run.expected();
+            if (!expected.equals(run.sink)) {
+                wrong.add(
+                        String.format(
+                                "seed %d (%s): expected %s but sink has %s",
+                                seed,
+                                joinType,
+                                new TreeMap<>(stringKeys(expected)),
+                                new TreeMap<>(stringKeys(run.sink))));
+            }
+        }
+        assertThat(wrong).as("runs whose sink differs from the join").isEmpty();
     }
 
     /** The same, reading single rows back from the output table by its primary key. */
@@ -262,6 +353,17 @@ class JoinKeyGroupRefreshOperatorTest {
         private final boolean parentRight;
 
         private long scopedRefreshes;
+
+        /** After a restore, input is taken before mails for a while. */
+        private boolean inputFirstAfterRestore;
+
+        private int inputFirst;
+
+        /** At most two pinned rows and room for two waiting keys. */
+        private boolean budget;
+
+        private long deferredKeys;
+        private long startsWhileFull;
 
         /** The first time the sink held a child twice within its join key, if ever. */
         private @Nullable String duplicateChild;
@@ -398,8 +500,9 @@ class JoinKeyGroupRefreshOperatorTest {
                                     new int[] {0, 1, 2, 0, 1, 2},
                                     OUTPUT_TYPE,
                                     mode)
-                            .capacity(1 + rnd.nextInt(4), 1_000_000)
-                            .maxUnpinnedGroups(rnd.nextInt(3))
+                            .capacity(1 + rnd.nextInt(4), budget ? 2 : 1_000_000)
+                            .maxCachedRows(rnd.nextInt(3))
+                            .maxPinnedRows(budget ? rnd.nextInt(3) : Long.MAX_VALUE)
                             .lookupTimeoutMs(60_000L)
                             .emitUpdateBefore(rnd.nextBoolean());
             if (mode == GroupRefreshOutputMode.READ_BACK) {
@@ -562,15 +665,18 @@ class JoinKeyGroupRefreshOperatorTest {
                                                         logs.get(table).size(),
                                                         committed[table] + 1 + rnd.nextInt(2)));
                     }
-                    if (emitted[t] < committed[t]) {
+                    if (emitted[t] < committed[t] && !inputBlocked()) {
                         options.add(() -> emit(table));
                     }
                 }
                 if (!pendingLookups.isEmpty()) {
                     options.add(this::completeLookup);
                 }
-                if (mailbox.hasMail()) {
+                if (mailbox.hasMail() && (inputFirst == 0 || !anyInput())) {
                     options.add(this::runMail);
+                }
+                if (inputFirst > 0) {
+                    inputFirst--;
                 }
                 if (!sinkChannel.isEmpty() && (rnd.nextInt(sinkSlowness) == 0 || !anyOther())) {
                     options.add(() -> applySink(1));
@@ -583,6 +689,10 @@ class JoinKeyGroupRefreshOperatorTest {
                 }
                 if (failuresLeft > 0 && lastCheckpoint != null && rnd.nextInt(40) == 0) {
                     options.add(this::fail);
+                }
+                if (options.isEmpty() && checkpoints && inFlightCheckpoint == null && hasWork()) {
+                    // refreshes wait for a checkpoint to release rows
+                    options.add(this::checkpointBarrier);
                 }
                 if (options.isEmpty()) {
                     if (failuresLeft > 0 && lastCheckpoint != null) {
@@ -599,9 +709,39 @@ class JoinKeyGroupRefreshOperatorTest {
                                     .getScheduler()
                                     .isIdle())
                     .isTrue();
-            scopedRefreshes =
-                    ((JoinKeyGroupRefreshOperator) harness.getOperator()).getScopedRefreshes();
+            JoinKeyGroupRefreshOperator operator =
+                    (JoinKeyGroupRefreshOperator) harness.getOperator();
+            assertThat(operator.hasDeferredKeys()).isFalse();
+            scopedRefreshes = operator.getScopedRefreshes();
+            deferredKeys += operator.getDeferredKeys();
+            startsWhileFull += operator.getStartsWhileFull();
             harness.close();
+        }
+
+        /**
+         * With room for two waiting keys, a change (at most two keys) blocks the input only while
+         * refreshes can start and some key waits already: the task would not take input then.
+         */
+        private boolean inputBlocked() {
+            if (!budget) {
+                return false;
+            }
+            RefreshScheduler<RowData, ?> scheduler =
+                    ((JoinKeyGroupRefreshOperator) harness.getOperator()).getScheduler();
+            return !scheduler.isGateClosed() && scheduler.numWaiting() > 0;
+        }
+
+        private boolean anyInput() {
+            return committed[0] < logs.get(0).size()
+                    || committed[1] < logs.get(1).size()
+                    || emitted[0] < committed[0]
+                    || emitted[1] < committed[1];
+        }
+
+        private boolean hasWork() {
+            JoinKeyGroupRefreshOperator operator =
+                    (JoinKeyGroupRefreshOperator) harness.getOperator();
+            return !operator.getScheduler().isIdle() || operator.hasDeferredKeys();
         }
 
         /** Whether anything but applying sink writes can happen. */
@@ -771,9 +911,17 @@ class JoinKeyGroupRefreshOperatorTest {
                 sinkChannel.clear();
                 pendingLookups.clear();
                 inFlightCheckpoint = null;
+                JoinKeyGroupRefreshOperator operator =
+                        (JoinKeyGroupRefreshOperator) harness.getOperator();
+                deferredKeys += operator.getDeferredKeys();
+                startsWhileFull += operator.getStartsWhileFull();
                 harness.close();
                 System.arraycopy(emittedAtCheckpoint, 0, emitted, 0, 2);
                 startOperator(lastCheckpoint);
+                if (inputFirstAfterRestore) {
+                    // new changes reach restored keys before the operator pulls them from state
+                    inputFirst = 20;
+                }
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }

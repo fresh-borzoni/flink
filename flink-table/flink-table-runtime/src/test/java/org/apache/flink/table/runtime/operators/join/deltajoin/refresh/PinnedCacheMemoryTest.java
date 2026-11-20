@@ -28,8 +28,9 @@ import org.apache.flink.table.utils.HandwrittenSelectorUtil;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -41,29 +42,47 @@ class PinnedCacheMemoryTest {
 
     /** Keeps no group once it may be read back, and never reads back in these tests. */
     private static GroupOutputMemory.PinnedCacheMemory memory() {
-        return memory(0, false);
+        return memory(0, Long.MAX_VALUE, false);
     }
 
     private static GroupOutputMemory.PinnedCacheMemory memory(
-            int maxUnpinned, boolean readYourWrites) {
+            long maxCachedRows, long maxPinnedRows, boolean readYourWrites) {
         return new GroupOutputMemory.PinnedCacheMemory(
                 null,
                 new RowDataSerializer(ROW_TYPE),
                 HandwrittenSelectorUtil.getRowDataSelector(
-                        new int[] {0}, ROW_TYPE.getChildren().toArray(new LogicalType[0])),
-                maxUnpinned,
+                        new int[] {1}, ROW_TYPE.getChildren().toArray(new LogicalType[0])),
+                maxCachedRows,
+                maxPinnedRows,
                 0L,
                 readYourWrites,
                 null);
     }
 
-    private static void write(GroupOutputMemory.PinnedCacheMemory memory, int key) {
-        RowData group = GenericRowData.of(key);
-        memory.written(group, Collections.emptyMap());
+    /** Writes a group of one row. */
+    private static void write(GroupOutputMemory.PinnedCacheMemory memory, int key)
+            throws Exception {
+        write(memory, key, 1);
+    }
+
+    private static void write(GroupOutputMemory.PinnedCacheMemory memory, int key, int rows)
+            throws Exception {
+        List<RowData> list = new ArrayList<>();
+        for (int i = 0; i < rows; i++) {
+            list.add(GenericRowData.of(key, i));
+        }
+        memory.written(
+                GenericRowData.of(key),
+                GroupOutputMemory.index(
+                        list,
+                        new RowDataSerializer(ROW_TYPE),
+                        HandwrittenSelectorUtil.getRowDataSelector(
+                                new int[] {1},
+                                ROW_TYPE.getChildren().toArray(new LogicalType[0]))));
     }
 
     @Test
-    void testAlignedCheckpointReleasesGroupsWrittenBeforeItsBarrier() {
+    void testAlignedCheckpointReleasesGroupsWrittenBeforeItsBarrier() throws Exception {
         GroupOutputMemory.PinnedCacheMemory memory = memory();
         write(memory, 1);
         memory.snapshotState(1, true);
@@ -77,7 +96,7 @@ class PinnedCacheMemoryTest {
     }
 
     @Test
-    void testUnalignedCheckpointFails() {
+    void testUnalignedCheckpointFails() throws Exception {
         GroupOutputMemory.PinnedCacheMemory memory = memory();
         write(memory, 1);
         assertThatThrownBy(() -> memory.snapshotState(1, false))
@@ -94,8 +113,8 @@ class PinnedCacheMemoryTest {
      * cache of the most recently written groups, whatever the checkpoints do.
      */
     @Test
-    void testReadYourWritesKeepsOnlyRecentGroups() {
-        GroupOutputMemory.PinnedCacheMemory memory = memory(2, true);
+    void testReadYourWritesKeepsOnlyRecentGroups() throws Exception {
+        GroupOutputMemory.PinnedCacheMemory memory = memory(2, Long.MAX_VALUE, true);
         write(memory, 1);
         write(memory, 2);
         write(memory, 3);
@@ -106,6 +125,56 @@ class PinnedCacheMemoryTest {
         assertThat(memory.size()).isEqualTo(2);
         memory.notifyCheckpointComplete(1);
         assertThat(memory.size()).isEqualTo(2);
+    }
+
+    /** The cache limit counts rows: one large group pushes out several small ones. */
+    @Test
+    void testCacheCountsRows() throws Exception {
+        GroupOutputMemory.PinnedCacheMemory memory = memory(3, Long.MAX_VALUE, true);
+        write(memory, 1);
+        write(memory, 2);
+        write(memory, 3);
+        assertThat(memory.size()).isEqualTo(3);
+        write(memory, 4, 2);
+        assertThat(memory.size()).isEqualTo(2);
+        // larger than the whole cache: read back when needed
+        write(memory, 5, 4);
+        assertThat(memory.size()).isEqualTo(2);
+    }
+
+    /** A pinned group larger than the cache is dropped as soon as it may be read back. */
+    @Test
+    void testLargeGroupIsDroppedOnceReadable() throws Exception {
+        GroupOutputMemory.PinnedCacheMemory memory = memory(2, Long.MAX_VALUE, false);
+        write(memory, 1, 5);
+        assertThat(memory.pinnedRows()).isEqualTo(5);
+        memory.snapshotState(1, true);
+        memory.notifyCheckpointComplete(1);
+        assertThat(memory.size()).isZero();
+        assertThat(memory.pinnedRows()).isZero();
+    }
+
+    /** Pinned rows beyond the budget make the memory full until a checkpoint releases them. */
+    @Test
+    void testFullUntilCheckpointReleasesRows() throws Exception {
+        GroupOutputMemory.PinnedCacheMemory memory = memory(10, 3, false);
+        write(memory, 1, 2);
+        write(memory, 2);
+        assertThat(memory.full()).isFalse();
+        write(memory, 3);
+        assertThat(memory.full()).isTrue();
+
+        // rewriting a group replaces its rows
+        write(memory, 3, 0);
+        assertThat(memory.full()).isFalse();
+        write(memory, 3, 2);
+        assertThat(memory.full()).isTrue();
+
+        memory.snapshotState(1, true);
+        memory.notifyCheckpointComplete(1);
+        assertThat(memory.full()).isFalse();
+        assertThat(memory.pinnedRows()).isZero();
+        assertThat(memory.size()).isEqualTo(3);
     }
 
     @Test

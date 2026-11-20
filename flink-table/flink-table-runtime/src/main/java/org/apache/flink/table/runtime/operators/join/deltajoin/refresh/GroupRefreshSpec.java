@@ -62,7 +62,8 @@ public final class GroupRefreshSpec implements Serializable {
     final int[][] declaredKeys;
     final int capacity;
     final int maxWaitingKeys;
-    final int maxUnpinnedGroups;
+    final long maxCachedRows;
+    final long maxPinnedRows;
     final long lookupTimeoutMs;
     final boolean emitUpdateBefore;
     final int maxGroupSize;
@@ -108,7 +109,8 @@ public final class GroupRefreshSpec implements Serializable {
         this.declaredKeys = builder.declaredKeys;
         this.capacity = builder.capacity;
         this.maxWaitingKeys = builder.maxWaitingKeys;
-        this.maxUnpinnedGroups = builder.maxUnpinnedGroups;
+        this.maxCachedRows = builder.maxCachedRows;
+        this.maxPinnedRows = builder.maxPinnedRows;
         this.lookupTimeoutMs = builder.lookupTimeoutMs;
         this.emitUpdateBefore = builder.emitUpdateBefore;
         this.maxGroupSize = builder.maxGroupSize;
@@ -174,7 +176,8 @@ public final class GroupRefreshSpec implements Serializable {
         private int[][] declaredKeys = new int[0][];
         private int capacity = 100;
         private int maxWaitingKeys = 1000;
-        private int maxUnpinnedGroups = 10_000;
+        private long maxCachedRows = 100_000;
+        private long maxPinnedRows = 200_000;
         private long lookupTimeoutMs;
         private boolean emitUpdateBefore = true;
         private int maxGroupSize = Integer.MAX_VALUE;
@@ -267,9 +270,18 @@ public final class GroupRefreshSpec implements Serializable {
             return this;
         }
 
-        /** The number of groups kept in memory once they could be read back. */
-        public Builder maxUnpinnedGroups(int maxUnpinnedGroups) {
-            this.maxUnpinnedGroups = maxUnpinnedGroups;
+        /** The number of emitted rows kept in memory once they could be read back. */
+        public Builder maxCachedRows(long maxCachedRows) {
+            this.maxCachedRows = maxCachedRows;
+            return this;
+        }
+
+        /**
+         * The number of emitted rows that may wait in memory for a checkpoint before the operator
+         * stops starting refreshes until a checkpoint completes. Read-your-writes keeps none.
+         */
+        public Builder maxPinnedRows(long maxPinnedRows) {
+            this.maxPinnedRows = maxPinnedRows;
             return this;
         }
 
