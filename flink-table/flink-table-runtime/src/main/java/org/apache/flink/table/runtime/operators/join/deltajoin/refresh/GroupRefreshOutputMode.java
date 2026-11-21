@@ -39,5 +39,14 @@ public enum GroupRefreshOutputMode {
      * keeping them in state: it remembers recently written groups in memory and reads other groups
      * back by their group key.
      */
-    READ_BACK
+    READ_BACK,
+
+    /**
+     * The inputs are cut into epochs and the tables are read as of epochs, see {@link
+     * org.apache.flink.table.connector.source.abilities.SupportsEpochs}. A note of an epoch waits
+     * until a watermark completes the epoch; then the group is read as of the epoch its emitted
+     * rows reflect and as of the watermark, and the difference is emitted. The operator keeps only
+     * that epoch for groups with notes, not the rows.
+     */
+    VERSIONED
 }

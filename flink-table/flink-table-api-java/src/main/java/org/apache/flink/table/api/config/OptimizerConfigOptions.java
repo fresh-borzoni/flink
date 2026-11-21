@@ -426,6 +426,22 @@ public class OptimizerConfigOptions {
 
     @Experimental
     @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<DeltaJoinVersioned>
+            TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_VERSIONED =
+                    key("table.optimizer.delta-join.group-refresh.versioned")
+                            .enumType(DeltaJoinVersioned.class)
+                            .defaultValue(DeltaJoinVersioned.NONE)
+                            .withDescription(
+                                    "Whether a group refresh delta join of tables that keep "
+                                            + "their history reads them as of the epochs of its "
+                                            + "sources. A change then reads only the lines "
+                                            + "through its row, the join keeps no state and "
+                                            + "reads nothing back, and its output equals the "
+                                            + "join of the tables as of every epoch. Requires a "
+                                            + "unique key on every input.");
+
+    @Experimental
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
     public static final ConfigOption<DeltaJoinGrouping>
             TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_GROUPING =
                     key("table.optimizer.delta-join.group-refresh.grouping")
@@ -504,6 +520,28 @@ public class OptimizerConfigOptions {
         @Override
         public String toString() {
             return value;
+        }
+
+        @Override
+        public InlineElement getDescription() {
+            return description;
+        }
+    }
+
+    /** When a group refresh delta join reads its tables as of epochs. */
+    @Experimental
+    public enum DeltaJoinVersioned implements DescribedEnum {
+        NONE(text("Never.")),
+        AUTO(
+                text(
+                        "If every table supports it and the join cannot read its output back "
+                                + "right after writing it.")),
+        FORCE(text("Always; planning fails if a table does not support it."));
+
+        private final InlineElement description;
+
+        DeltaJoinVersioned(InlineElement description) {
+            this.description = description;
         }
 
         @Override

@@ -27,6 +27,7 @@ import org.apache.flink.streaming.api.functions.async.CollectionSupplier;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
 import org.apache.flink.table.connector.source.lookup.SupportsPagedLookup;
+import org.apache.flink.table.connector.source.lookup.SupportsVersionedLookup;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.binary.BinaryRowData;
@@ -43,6 +44,7 @@ import org.apache.flink.table.runtime.operators.join.deltajoin.refresh.LineRowDa
 import org.apache.flink.table.runtime.typeutils.RowDataSerializer;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.Preconditions;
 
@@ -61,6 +63,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -92,6 +95,7 @@ final class AnchorJoinEvaluator {
     private final ArrayDeque<Runnable> waitingLookups = new ArrayDeque<>();
     private long numLookups;
     private long numSharedLookups;
+    private long numCachedReads;
 
     private transient Lookup[] lookups;
     private transient JoinCondition[] conditions;
@@ -123,6 +127,18 @@ final class AnchorJoinEvaluator {
     /** Per lookup directed away from the anchor, the table it returns rows of; -1 otherwise. */
     private transient int[] leafOfLookup;
 
+    /** Per lookup, the table it returns rows of. */
+    private transient int[] targetOfLookup;
+
+    /** Per node, the join above it; -1 for the root. */
+    private transient int[] parentNodes;
+
+    /** Per table, its node. */
+    private transient int[] leafNodes;
+
+    /** Per table, the serializer of its rows; to compare lines read by different evaluations. */
+    private transient RowDataSerializer[] leafSerializers;
+
     AnchorJoinEvaluator(
             AnchorJoinTree tree,
             AnchorLookupSpec[] lookupSpecs,
@@ -153,6 +169,23 @@ final class AnchorJoinEvaluator {
     /** The number of lookups answered by an identical lookup in flight. */
     long getNumSharedLookups() {
         return numSharedLookups;
+    }
+
+    /** The number of reads as of an epoch answered by an earlier read of the same epoch. */
+    long getNumCachedReads() {
+        return numCachedReads;
+    }
+
+    /** Drops the kept reads as of the epochs before the given one. */
+    void evictReadsBefore(long epoch) {
+        if (lookups == null) {
+            return;
+        }
+        for (Lookup lookup : lookups) {
+            if (lookup != null) {
+                lookup.readsByEpoch.headMap(epoch, false).clear();
+            }
+        }
     }
 
     private void issueOrWait(Runnable lookup) {
@@ -229,6 +262,35 @@ final class AnchorJoinEvaluator {
                 leafOfLookup[lookupsAwayFrom[leaf][i]] = away[i];
             }
         }
+        targetOfLookup = new int[lookupSpecs.length];
+        Arrays.fill(targetOfLookup, -1);
+        targetOfLookup[tree.getAnchorLookup()] = tree.getAnchorLeaf();
+        for (int e = 0; e < tree.getNumLeaves() - 1; e++) {
+            AnchorJoinTree.Edge edge = tree.getEdge(e);
+            targetOfLookup[edge.getLookupRight()] = edge.getRightLeaf();
+            targetOfLookup[edge.getLookupLeft()] = edge.getLeftLeaf();
+        }
+        for (int leaf = 0; leaf < tree.getNumLeaves(); leaf++) {
+            if (tree.getGroupLookup(leaf) >= 0) {
+                targetOfLookup[tree.getGroupLookup(leaf)] = leaf;
+            }
+        }
+        parentNodes = new int[tree.getNumNodes()];
+        Arrays.fill(parentNodes, -1);
+        leafNodes = new int[tree.getNumLeaves()];
+        for (int n = 0; n < tree.getNumNodes(); n++) {
+            AnchorJoinTree.Node node = tree.getNode(n);
+            if (node.isLeaf()) {
+                leafNodes[node.getLeaf()] = n;
+            } else {
+                parentNodes[node.getLeft()] = n;
+                parentNodes[node.getRight()] = n;
+            }
+        }
+        leafSerializers = new RowDataSerializer[tree.getNumLeaves()];
+        for (int leaf = 0; leaf < tree.getNumLeaves(); leaf++) {
+            leafSerializers[leaf] = new RowDataSerializer(tree.getLeafType(leaf));
+        }
         keyedByAnchorKey = new boolean[lookupSpecs.length];
         for (int lookup : lookupsAwayFrom[tree.getAnchorLeaf()]) {
             keyedByAnchorKey[lookup] =
@@ -239,8 +301,16 @@ final class AnchorJoinEvaluator {
         groupIndexSerializers = new RowDataSerializer[lookupSpecs.length];
         for (int e = 0; e < tree.getNumLeaves() - 1; e++) {
             AnchorJoinTree.Edge edge = tree.getEdge(e);
-            indexGroupRows(edge.getLookupRight(), edge.getLeftFields(), edge.getRightLeaf(), edge.getRightFields());
-            indexGroupRows(edge.getLookupLeft(), edge.getRightFields(), edge.getLeftLeaf(), edge.getLeftFields());
+            indexGroupRows(
+                    edge.getLookupRight(),
+                    edge.getLeftFields(),
+                    edge.getRightLeaf(),
+                    edge.getRightFields());
+            indexGroupRows(
+                    edge.getLookupLeft(),
+                    edge.getRightFields(),
+                    edge.getLeftLeaf(),
+                    edge.getLeftFields());
         }
     }
 
@@ -264,8 +334,7 @@ final class AnchorJoinEvaluator {
                     field = leafFields[i];
                 }
             }
-            if (field < 0
-                    || !leafType.getTypeAt(field).copy(true).equals(keyTypes[k].copy(true))) {
+            if (field < 0 || !leafType.getTypeAt(field).copy(true).equals(keyTypes[k].copy(true))) {
                 // the rows are looked up one by one
                 return;
             }
@@ -590,6 +659,267 @@ final class AnchorJoinEvaluator {
         return byLookup;
     }
 
+    /**
+     * The lines that a change of one row can alter, at two cuts that differ only in the row's
+     * table; {@code before} and {@code after} are the row at either cut, null where it is absent.
+     * Returns the lines at the first cut, then at the second.
+     *
+     * <p>Besides the lines holding the row, a padded line appears or disappears where its preserved
+     * line loses or finds its last match, so every preserved line that a changed line matched at
+     * either cut is checked at both. Lines that did not change come out equal at both cuts.
+     */
+    CompletableFuture<List<List<RowData[]>>> deltaLines(
+            int leaf,
+            @Nullable RowData before,
+            @Nullable RowData after,
+            long[] epochsBefore,
+            long[] epochsAfter) {
+        return deltaLines(
+                leaf,
+                before == null ? Collections.emptyList() : Collections.singletonList(before),
+                after == null ? Collections.emptyList() : Collections.singletonList(after),
+                epochsBefore,
+                epochsAfter);
+    }
+
+    /** As {@link #deltaLines(int, RowData, RowData, long[], long[])} for several rows at once. */
+    @SuppressWarnings("unchecked")
+    CompletableFuture<List<List<RowData[]>>> deltaLines(
+            int leaf,
+            List<RowData> befores,
+            List<RowData> afters,
+            long[] epochsBefore,
+            long[] epochsAfter) {
+        // both cuts read every other table as of the same epoch
+        Map<VersionedRead, CompletableFuture<List<RowData>>>[] shared = new Map[lookups.length];
+        Evaluation[] cuts = {
+            new Evaluation(epochsBefore, shared), new Evaluation(epochsAfter, shared)
+        };
+        List<List<RowData[]>> lines = new ArrayList<>(2);
+        lines.add(linesOf(leaf, befores));
+        lines.add(linesOf(leaf, afters));
+        return climb(leafNodes[leaf], lines, cuts);
+    }
+
+    private List<RowData[]> linesOf(int leaf, List<RowData> rows) {
+        List<RowData[]> lines = new ArrayList<>(rows.size());
+        for (RowData row : rows) {
+            RowData[] line = new RowData[tree.getNumLeaves()];
+            line[leaf] = row;
+            lines.add(line);
+        }
+        return lines;
+    }
+
+    /** Extends the lines of a node at both cuts to the join above it, up to the root. */
+    private CompletableFuture<List<List<RowData[]>>> climb(
+            int nodeId, List<List<RowData[]>> lines, Evaluation[] cuts) {
+        if (nodeId == tree.getRootNode()) {
+            return CompletableFuture.completedFuture(lines);
+        }
+        int joinId = parentNodes[nodeId];
+        AnchorJoinTree.Node join = tree.getNode(joinId);
+        boolean inLeft = join.getLeft() == nodeId;
+        int otherNode = inLeft ? join.getRight() : join.getLeft();
+        AnchorJoinTree.Edge edge = tree.getEdge(join.getEdge());
+        int sideLeaf = inLeft ? edge.getLeftLeaf() : edge.getRightLeaf();
+        int otherLeaf = inLeft ? edge.getRightLeaf() : edge.getLeftLeaf();
+        int towardsOther = inLeft ? edge.getLookupRight() : edge.getLookupLeft();
+        int towardsSide = inLeft ? edge.getLookupLeft() : edge.getLookupRight();
+        FlinkJoinType type = join.getJoinType();
+        boolean sidePreserved =
+                type == FlinkJoinType.FULL
+                        || (inLeft ? type == FlinkJoinType.LEFT : type == FlinkJoinType.RIGHT);
+        boolean otherPreserved =
+                type == FlinkJoinType.FULL
+                        || (inLeft ? type == FlinkJoinType.RIGHT : type == FlinkJoinType.LEFT);
+        Extended[] extended = new Extended[2];
+        List<CompletableFuture<Void>> parts = new ArrayList<>(2);
+        for (int c = 0; c < 2; c++) {
+            int cut = c;
+            parts.add(
+                    extendAll(
+                                    joinId,
+                                    lines.get(c),
+                                    sideLeaf,
+                                    towardsOther,
+                                    otherNode,
+                                    otherLeaf,
+                                    sidePreserved,
+                                    cuts[c])
+                            .thenAccept(result -> extended[cut] = result));
+        }
+        return CompletableFuture.allOf(parts.toArray(new CompletableFuture[0]))
+                .thenCompose(
+                        ignored -> {
+                            if (!otherPreserved) {
+                                return climb(joinId, linesOf(joinId, extended), cuts);
+                            }
+                            // the preserved lines whose padding the change may have flipped
+                            Map<List<BinaryRowData>, RowData[]> candidates = new LinkedHashMap<>();
+                            for (Extended e : extended) {
+                                candidates.putAll(e.matched);
+                            }
+                            List<CompletableFuture<Void>> checks = new ArrayList<>();
+                            for (int c = 0; c < 2; c++) {
+                                Extended e = extended[c];
+                                for (Map.Entry<List<BinaryRowData>, RowData[]> candidate :
+                                        candidates.entrySet()) {
+                                    if (e.matched.containsKey(candidate.getKey())) {
+                                        continue;
+                                    }
+                                    RowData[] other = candidate.getValue();
+                                    checks.add(
+                                            hasMatch(
+                                                            joinId,
+                                                            other,
+                                                            otherLeaf,
+                                                            towardsSide,
+                                                            nodeId,
+                                                            sideLeaf,
+                                                            cuts[c])
+                                                    .thenAccept(
+                                                            found -> {
+                                                                if (!found) {
+                                                                    e.padded.add(other.clone());
+                                                                }
+                                                            }));
+                                }
+                            }
+                            return CompletableFuture.allOf(checks.toArray(new CompletableFuture[0]))
+                                    .thenCompose(
+                                            done -> climb(joinId, linesOf(joinId, extended), cuts));
+                        });
+    }
+
+    private List<List<RowData[]>> linesOf(int joinId, Extended[] extended) {
+        List<List<RowData[]>> lines = new ArrayList<>(2);
+        for (Extended e : extended) {
+            List<RowData[]> all = new ArrayList<>(e.lines);
+            all.addAll(applyFilters(joinId, e.padded));
+            lines.add(all);
+        }
+        return lines;
+    }
+
+    /**
+     * Extends the given lines of one side of a join with the matching lines of the other side, and
+     * remembers the lines of the other side that matched.
+     */
+    private CompletableFuture<Extended> extendAll(
+            int joinId,
+            List<RowData[]> partials,
+            int sideLeaf,
+            int towardsOther,
+            int otherNode,
+            int otherLeaf,
+            boolean sidePreserved,
+            Evaluation evaluation) {
+        Extended result = new Extended();
+        List<CompletableFuture<Void>> parts = new ArrayList<>(partials.size());
+        for (RowData[] partial : partials) {
+            parts.add(
+                    linesOfOtherSide(
+                                    partial[sideLeaf],
+                                    towardsOther,
+                                    otherNode,
+                                    otherLeaf,
+                                    evaluation)
+                            .thenAccept(
+                                    others -> {
+                                        boolean any = false;
+                                        for (RowData[] other : others) {
+                                            RowData[] merged = merge(partial, other);
+                                            if (matches(joinId, merged)) {
+                                                result.lines.add(merged);
+                                                result.matched.putIfAbsent(lineKey(other), other);
+                                                any = true;
+                                            }
+                                        }
+                                        if (!any && sidePreserved) {
+                                            result.lines.add(partial);
+                                        }
+                                    }));
+        }
+        return CompletableFuture.allOf(parts.toArray(new CompletableFuture[0]))
+                .thenApply(
+                        ignored -> {
+                            List<RowData[]> filtered =
+                                    new ArrayList<>(applyFilters(joinId, result.lines));
+                            result.lines.clear();
+                            result.lines.addAll(filtered);
+                            return result;
+                        });
+    }
+
+    /** The lines of a node holding a row of its table that matches the key of {@code source}. */
+    private CompletableFuture<List<RowData[]>> linesOfOtherSide(
+            @Nullable RowData source, int lookupId, int node, int leaf, Evaluation evaluation) {
+        if (source == null) {
+            // the edge table of this side was padded, so its join key is NULL
+            return CompletableFuture.completedFuture(Collections.emptyList());
+        }
+        return evaluation
+                .lookup(lookupId, source)
+                .thenCompose(
+                        rows -> {
+                            List<CompletableFuture<List<RowData[]>>> lines =
+                                    new ArrayList<>(rows.size());
+                            for (RowData row : rows) {
+                                lines.add(linesContaining(node, leaf, row, evaluation));
+                            }
+                            return flatten(lines);
+                        });
+    }
+
+    /** Whether a line of the preserved side of a join matches any line of the other side. */
+    private CompletableFuture<Boolean> hasMatch(
+            int joinId,
+            RowData[] preserved,
+            int preservedLeaf,
+            int towardsSide,
+            int sideNode,
+            int sideLeaf,
+            Evaluation evaluation) {
+        return linesOfOtherSide(
+                        preserved[preservedLeaf], towardsSide, sideNode, sideLeaf, evaluation)
+                .thenApply(
+                        sides -> {
+                            for (RowData[] side : sides) {
+                                if (matches(joinId, merge(preserved, side))) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        });
+    }
+
+    /** The rows of a line as binary rows, to compare lines read by different evaluations. */
+    private List<BinaryRowData> lineKey(RowData[] line) {
+        List<BinaryRowData> key = new ArrayList<>(line.length);
+        for (int leaf = 0; leaf < line.length; leaf++) {
+            if (line[leaf] == null) {
+                key.add(null);
+                continue;
+            }
+            BinaryRowData row = leafSerializers[leaf].toBinaryRow(line[leaf]).copy();
+            row.setRowKind(RowKind.INSERT);
+            key.add(row);
+        }
+        return key;
+    }
+
+    /** The lines of one cut extended over one join. */
+    private static final class Extended {
+        final List<RowData[]> lines = new ArrayList<>();
+
+        /** The lines of the other side that matched, by their rows. */
+        final Map<List<BinaryRowData>, RowData[]> matched = new LinkedHashMap<>();
+
+        /** Lines of the other side that match nothing at this cut, padded. */
+        final List<RowData[]> padded = new ArrayList<>();
+    }
+
     private CompletableFuture<List<RowData[]>> evaluate(RowData anchorKey, Evaluation evaluation) {
         long start = evaluation.start;
         int anchorLeaf = tree.getAnchorLeaf();
@@ -814,7 +1144,9 @@ final class AnchorJoinEvaluator {
         /** Per table read by group, all its rows of the group. */
         private final Map<Integer, CompletableFuture<List<RowData>>> groupRows = new HashMap<>();
 
-        /** Per lookup into a table read by group, the rows of the group by the key of the lookup. */
+        /**
+         * Per lookup into a table read by group, the rows of the group by the key of the lookup.
+         */
         private final Map<Integer, CompletableFuture<Map<BinaryRowData, List<RowData>>>>
                 groupIndexes = new HashMap<>();
 
@@ -822,11 +1154,31 @@ final class AnchorJoinEvaluator {
             this(start, scope, Collections.emptyMap());
         }
 
+        /** Per table, the epoch it is read as of; null to read by {@link #start}. */
+        private final @Nullable long[] epochOfLeaf;
+
+        /** With {@link #epochOfLeaf}: per lookup, the reads by key and epoch, shared by cuts. */
+        private final @Nullable Map<VersionedRead, CompletableFuture<List<RowData>>>[] versioned;
+
         private Evaluation(
                 long start, @Nullable RowScope scope, Map<Integer, List<RowData>> known) {
             this.start = start;
             this.scope = scope;
             this.known = known;
+            this.epochOfLeaf = null;
+            this.versioned = null;
+        }
+
+        /** Reads every table as of its own epoch. */
+        private Evaluation(
+                long[] epochOfLeaf, Map<VersionedRead, CompletableFuture<List<RowData>>>[] shared) {
+            Preconditions.checkArgument(
+                    epochOfLeaf.length == tree.getNumLeaves(), "Every table needs an epoch.");
+            this.start = 0L;
+            this.scope = null;
+            this.known = Collections.emptyMap();
+            this.epochOfLeaf = epochOfLeaf;
+            this.versioned = shared;
         }
 
         /** The rows of the given lookup for the key in {@code source}. */
@@ -836,6 +1188,14 @@ final class AnchorJoinEvaluator {
             if (key == null) {
                 // NULL never equals anything
                 return CompletableFuture.completedFuture(Collections.emptyList());
+            }
+            if (epochOfLeaf != null) {
+                if (versioned[lookupId] == null) {
+                    versioned[lookupId] = new HashMap<>();
+                }
+                long epoch = epochOfLeaf[targetOfLookup[lookupId]];
+                return versioned[lookupId].computeIfAbsent(
+                        new VersionedRead(key, epoch), read -> lookup.lookupAsOf(key, epoch));
             }
             List<RowData> given =
                     scope != null && lookupId == scope.lookupId
@@ -900,7 +1260,8 @@ final class AnchorJoinEvaluator {
 
         /** Starts the lookups beyond the rows of every table read by group, once they arrive. */
         void startAwayFromGroups() {
-            for (Map.Entry<Integer, CompletableFuture<List<RowData>>> entry : groupRows.entrySet()) {
+            for (Map.Entry<Integer, CompletableFuture<List<RowData>>> entry :
+                    groupRows.entrySet()) {
                 int leaf = entry.getKey();
                 entry.getValue()
                         .thenAccept(
@@ -1164,6 +1525,16 @@ final class AnchorJoinEvaluator {
         /** The lookup function of the fetcher if it reads in pages. */
         private @Nullable SupportsPagedLookup pagedFunction;
 
+        /** The lookup function of the fetcher if it reads as of epochs. */
+        private @Nullable SupportsVersionedLookup versionedFunction;
+
+        /** The reads as of every kept epoch, by key. */
+        private final TreeMap<Long, Map<BinaryRowData, CompletableFuture<List<RowData>>>>
+                readsByEpoch = new TreeMap<>();
+
+        /** Reads the fields of a key row of this lookup. */
+        private RowData.FieldGetter[] keyRowGetters;
+
         private Lookup(AnchorLookupSpec spec) {
             this.spec = spec;
         }
@@ -1188,9 +1559,14 @@ final class AnchorJoinEvaluator {
                 keyGetters[i] = RowData.createFieldGetter(keyTypes[i], keyFields[i]);
             }
             keySerializer = new RowDataSerializer(keyTypes);
+            keyRowGetters = new RowData.FieldGetter[keyTypes.length];
+            for (int i = 0; i < keyTypes.length; i++) {
+                keyRowGetters[i] = RowData.createFieldGetter(keyTypes[i], i);
+            }
             if (spec.isPaged()) {
                 pagedFunction = GroupLookup.pagedFunctionOf(spec.getFetcher());
             }
+            versionedFunction = GroupLookup.versionedFunctionOrNull(spec.getFetcher());
         }
 
         /** Opens the pages of the rows that match the key of {@code source}. */
@@ -1339,6 +1715,74 @@ final class AnchorJoinEvaluator {
                                     }));
         }
 
+        /**
+         * Reads the rows matching {@code key} as of the epoch. Such reads never change, so they are
+         * kept, also in flight, until {@link #evictReadsBefore} drops their epoch.
+         */
+        private CompletableFuture<List<RowData>> lookupAsOf(BinaryRowData key, long epoch) {
+            Preconditions.checkState(
+                    versionedFunction != null,
+                    "The lookup %s cannot read as of an epoch.",
+                    spec.getDescription());
+            Map<BinaryRowData, CompletableFuture<List<RowData>>> ofEpoch =
+                    readsByEpoch.computeIfAbsent(epoch, e -> new HashMap<>());
+            CompletableFuture<List<RowData>> kept = ofEpoch.get(key);
+            if (kept != null) {
+                numCachedReads++;
+                return kept;
+            }
+            CompletableFuture<List<RowData>> read = new CompletableFuture<>();
+            ofEpoch.put(key, read);
+            read.whenComplete(
+                    (rows, error) -> {
+                        if (error != null) {
+                            ofEpoch.remove(key, read);
+                        }
+                    });
+            issueOrWait(() -> invokeAsOf(key, epoch, read));
+            return read;
+        }
+
+        private void invokeAsOf(
+                BinaryRowData key, long epoch, CompletableFuture<List<RowData>> result) {
+            lookupsInFlight++;
+            numLookups++;
+            CompletableFuture<Collection<RowData>> raw;
+            try {
+                GenericRowData keyRow = new GenericRowData(keyRowGetters.length);
+                for (int i = 0; i < keyRowGetters.length; i++) {
+                    keyRow.setField(i, keyRowGetters[i].getFieldOrNull(key));
+                }
+                raw = versionedFunction.asyncLookupAsOf(keyRow, epoch);
+            } catch (Throwable t) {
+                raw = new CompletableFuture<>();
+                raw.completeExceptionally(t);
+            }
+            if (timeoutMs > 0) {
+                raw = raw.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+            }
+            raw.whenComplete(
+                    (rows, error) ->
+                            mailbox.execute(
+                                    () -> {
+                                        lookupDone();
+                                        if (error != null) {
+                                            result.completeExceptionally(
+                                                    wrap(error, "The read as of an epoch of"));
+                                            return;
+                                        }
+                                        try {
+                                            result.complete(
+                                                    pageRows(
+                                                            rows == null
+                                                                    ? Collections.emptyList()
+                                                                    : rows));
+                                        } catch (Throwable t) {
+                                            result.completeExceptionally(t);
+                                        }
+                                    }));
+        }
+
         private Throwable wrap(Throwable error, String what) {
             if (!(error instanceof TimeoutException)) {
                 return error;
@@ -1376,6 +1820,31 @@ final class AnchorJoinEvaluator {
                 }
             }
             return result;
+        }
+    }
+
+    /** A read of the rows of a key as of an epoch. */
+    private static final class VersionedRead {
+        private final BinaryRowData key;
+        private final long epoch;
+
+        private VersionedRead(BinaryRowData key, long epoch) {
+            this.key = key;
+            this.epoch = epoch;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof VersionedRead)) {
+                return false;
+            }
+            VersionedRead other = (VersionedRead) o;
+            return epoch == other.epoch && key.equals(other.key);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * key.hashCode() + Long.hashCode(epoch);
         }
     }
 }

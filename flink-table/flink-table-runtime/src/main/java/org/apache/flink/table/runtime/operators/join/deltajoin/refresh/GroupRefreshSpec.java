@@ -82,8 +82,11 @@ public final class GroupRefreshSpec implements Serializable {
                 "Without a projection, the joined rows are emitted.");
         Preconditions.checkArgument(
                 (builder.outputMode == GroupRefreshOutputMode.READ_BACK)
-                        == (builder.outputLookup != null && builder.outputKey != null),
-                "Reading back, and only reading back, needs the key and a lookup of the output.");
+                        == (builder.outputLookup != null),
+                "Reading back, and only reading back, needs a lookup of the output.");
+        Preconditions.checkArgument(
+                builder.outputLookup == null || builder.outputKey != null,
+                "Reading back needs the key of the output.");
         Preconditions.checkArgument(
                 (builder.outputMode == GroupRefreshOutputMode.UPSERT)
                         == (builder.outputGroupKey != null),
@@ -209,6 +212,15 @@ public final class GroupRefreshSpec implements Serializable {
          * For {@link GroupRefreshOutputMode#READ_BACK}: the primary key of the output table on the
          * emitted rows, and a lookup of the rows of a group key in the output table.
          */
+        /**
+         * The primary key of the output table on the emitted rows, by which a group keeps its rows
+         * apart, without reading them back; for {@link GroupRefreshOutputMode#VERSIONED}.
+         */
+        public Builder outputKey(RowDataKeySelector outputKey) {
+            this.outputKey = outputKey;
+            return this;
+        }
+
         public Builder readBack(RowDataKeySelector outputKey, GroupLookup outputLookup) {
             this.outputKey = outputKey;
             this.outputLookup = outputLookup;

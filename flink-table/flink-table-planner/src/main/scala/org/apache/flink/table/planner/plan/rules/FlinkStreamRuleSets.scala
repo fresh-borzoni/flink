@@ -570,7 +570,8 @@ object FlinkStreamRuleSets {
    */
   val GROUP_REFRESH_DELTA_JOIN_RULES: RuleSet = RuleSets.ofList(
     GroupRefreshDeltaJoinRule.INSTANCE,
-    DeltaJoinReadBackRule.INSTANCE
+    DeltaJoinReadBackRule.INSTANCE,
+    DeltaJoinVersionedRule.INSTANCE
   )
 
   /** RuleSet to optimize plans after stream exec execution. */

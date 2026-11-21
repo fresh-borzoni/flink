@@ -108,9 +108,14 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
 
     @Override
     public boolean matches(RelOptRuleCall call) {
-        // the join exists only if the option or the hint enabled it
-        return unwrapTableConfig(call)
-                .get(OptimizerConfigOptions.TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_READ_BACK);
+        // the join exists only if the option or the hint enabled it; a join forced to read its
+        // tables as of epochs never reads its output back
+        TableConfig config = unwrapTableConfig(call);
+        return config.get(OptimizerConfigOptions.TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_READ_BACK)
+                || config.get(
+                                OptimizerConfigOptions
+                                        .TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_VERSIONED)
+                        != OptimizerConfigOptions.DeltaJoinVersioned.NONE;
     }
 
     @Override
@@ -134,7 +139,30 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
                         ? calc.getProgram()
                         : RexProgram.createIdentity(join.getRowType(), join.getRowType());
         String table = sink.contextResolvedTable().getIdentifier().asSummaryString();
-        Analysis analysis = new Analysis(join, projection, sink);
+        TableConfig config = unwrapTableConfig(sink);
+        OptimizerConfigOptions.DeltaJoinVersioned versioned =
+                config.get(
+                        OptimizerConfigOptions.TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_VERSIONED);
+        boolean readBackEnabled =
+                config.get(
+                        OptimizerConfigOptions.TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_READ_BACK);
+        if (versioned != OptimizerConfigOptions.DeltaJoinVersioned.NONE) {
+            Analysis readYourWrites =
+                    readBackEnabled ? new Analysis(join, projection, sink, false) : null;
+            boolean preferReadYourWrites =
+                    versioned == OptimizerConfigOptions.DeltaJoinVersioned.AUTO
+                            && readYourWrites != null
+                            && readYourWrites.readBack != null
+                            && readYourWrites.readYourWritesSink != null;
+            if (!preferReadYourWrites && emitsVersioned(call, sink, join, projection, versioned)) {
+                return;
+            }
+            if (!readBackEnabled || versioned == OptimizerConfigOptions.DeltaJoinVersioned.FORCE) {
+                // the join reads its tables as of epochs without an output table, if it can
+                return;
+            }
+        }
+        Analysis analysis = new Analysis(join, projection, sink, false);
         // the join may be grouped otherwise: by the join key if it has a parent, so that a child
         // refreshes only its own rows and a parent reads its children at once; otherwise by what
         // the output table is keyed by
@@ -142,7 +170,7 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
         if (alternative != null
                 && (GroupRefreshDeltaJoinUtil.hasParent(alternative.getTree())
                         || !analysis.keyedByGroups())) {
-            Analysis other = new Analysis(alternative, projection, sink);
+            Analysis other = new Analysis(alternative, projection, sink, false);
             if (other.readBack != null) {
                 LOG.info(
                         "The delta join that writes {} groups by the join key, by which its rows "
@@ -187,6 +215,52 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
                         abilities,
                         sink.upsertMaterialize(),
                         sink.conflictStrategy()));
+    }
+
+    /**
+     * Lets the join read its tables as of epochs and emit the rows of the output table, keyed by
+     * its primary key, so that the sink needs no materialization. Returns false if it cannot.
+     */
+    private static boolean emitsVersioned(
+            RelOptRuleCall call,
+            StreamPhysicalSink sink,
+            StreamPhysicalGroupRefreshDeltaJoin join,
+            RexProgram projection,
+            OptimizerConfigOptions.DeltaJoinVersioned versioned) {
+        StreamPhysicalGroupRefreshDeltaJoin anchored = join;
+        if (join.getTree().grouping != GroupRefreshDeltaJoinSpec.Grouping.ANCHOR
+                && join.getAlternative() != null
+                && join.getAlternative().getTree().grouping
+                        == GroupRefreshDeltaJoinSpec.Grouping.ANCHOR) {
+            anchored = join.getAlternative();
+        }
+        String domain =
+                DeltaJoinVersionedRule.domainOf(
+                        anchored, versioned == OptimizerConfigOptions.DeltaJoinVersioned.FORCE);
+        if (domain == null) {
+            return false;
+        }
+        Analysis analysis = new Analysis(anchored, projection, sink, true);
+        String table = sink.contextResolvedTable().getIdentifier().asSummaryString();
+        if (analysis.readBack == null) {
+            LOG.info(
+                    "The delta join that writes {} reads its tables as of epochs, but emits its "
+                            + "joined rows: {}.",
+                    table,
+                    analysis.reason);
+            return false;
+        }
+        LOG.info(
+                "The delta join that writes {} reads its tables as of epochs and emits the rows of "
+                        + "the table, keyed by its primary key.",
+                table);
+        RelNode versionedJoin =
+                anchored.withVersioned(
+                        domain,
+                        DeltaJoinVersionedRule.inputsWithEpochs(anchored, domain),
+                        analysis.readBack);
+        call.transformTo(sink.copy(sink.getTraitSet(), Collections.singletonList(versionedJoin)));
+        return true;
     }
 
     /**
@@ -241,10 +315,18 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
         /** The sink, made to let the join read what it wrote, if it can. */
         private @Nullable DynamicTableSink readYourWritesSink;
 
+        /**
+         * Whether the join reads its tables as of epochs instead of reading its output back: then
+         * the output table need not be readable, only keyed by the groups.
+         */
+        private final boolean versioned;
+
         private Analysis(
                 StreamPhysicalGroupRefreshDeltaJoin join,
                 RexProgram program,
-                StreamPhysicalSink sink) {
+                StreamPhysicalSink sink,
+                boolean versioned) {
+            this.versioned = versioned;
             this.join = join;
             this.tree = join.getTree();
             this.joinedType = FlinkTypeFactory.toLogicalRowType(join.getRowType());
@@ -268,7 +350,7 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
         }
 
         private @Nullable String analyze(RexProgram program, StreamPhysicalSink sink) {
-            if (takesUpsertsByAnchorKey(sink)) {
+            if (!versioned && takesUpsertsByAnchorKey(sink)) {
                 return "every group has at most one row, which the join upserts by its key";
             }
             if (sink.targetColumns() != null) {
@@ -276,8 +358,8 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
             }
             TableConfig tableConfig = unwrapTableConfig(sink);
             Configuration configuration = Configuration.fromMap(tableConfig.toMap());
-            readYourWritesSink = readYourWritesSink(sink, configuration);
-            if (readYourWritesSink == null) {
+            readYourWritesSink = versioned ? null : readYourWritesSink(sink, configuration);
+            if (!versioned && readYourWritesSink == null) {
                 if (!configuration
                         .getOptional(CheckpointingOptions.CHECKPOINTING_INTERVAL)
                         .isPresent()) {
@@ -344,9 +426,10 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
                             .mapToObj(schema.getColumnNames()::get)
                             .collect(Collectors.toList());
             boolean indexed =
-                    schema.getIndexes().stream()
-                            .map(Index::getColumns)
-                            .anyMatch(groupColumnNames::containsAll);
+                    versioned
+                            || schema.getIndexes().stream()
+                                    .map(Index::getColumns)
+                                    .anyMatch(groupColumnNames::containsAll);
             if (!indexed) {
                 return String.format(
                         "the output table has no index on the columns %s that hold the group key",
@@ -362,8 +445,10 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
             }
 
             try {
-                new DynamicTableSourceSpec(table, Collections.emptyList())
-                        .getLookupTableSource(unwrapContext(sink), unwrapTypeFactory(sink));
+                if (!versioned) {
+                    new DynamicTableSourceSpec(table, Collections.emptyList())
+                            .getLookupTableSource(unwrapContext(sink), unwrapTypeFactory(sink));
+                }
             } catch (Throwable t) {
                 return "the output table cannot be looked up: " + t.getMessage();
             }
@@ -388,7 +473,8 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
 
         /**
          * Whether the join can upsert by the anchor key instead of reading back: single-row groups
-         * keyed by it and a sink taking key deletes. Asked from the sink, before changelog inference.
+         * keyed by it and a sink taking key deletes. Asked from the sink, before changelog
+         * inference.
          */
         private boolean takesUpsertsByAnchorKey(StreamPhysicalSink sink) {
             if (!primaryKeyIsAnchorKey() || sink.conflictStrategy() != null) {
@@ -534,7 +620,8 @@ public class DeltaJoinReadBackRule extends RelRule<DeltaJoinReadBackRule.Config>
 
         /**
          * Key fields that need no column of their own: held by a primary key column, tied to the
-         * anchor key, or equal to such a field through an equi-join that drops their unmatched rows.
+         * anchor key, or equal to such a field through an equi-join that drops their unmatched
+         * rows.
          */
         private Set<List<Integer>> heldFields() {
             Set<List<Integer>> held = fieldsTiedToAnchorKey();

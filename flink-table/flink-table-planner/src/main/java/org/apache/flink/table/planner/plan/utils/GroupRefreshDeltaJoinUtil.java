@@ -68,8 +68,8 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Deque;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
@@ -721,8 +721,8 @@ public final class GroupRefreshDeltaJoinUtil {
     }
 
     /**
-     * Tables two or more joins from the anchor whose rows hold the anchor key and are looked up
-     * by it: a refresh reads them once per group instead of once per parent row.
+     * Tables two or more joins from the anchor whose rows hold the anchor key and are looked up by
+     * it: a refresh reads them once per group instead of once per parent row.
      */
     private static void computeGroupReads(JoinTree tree) {
         int numLeaves = tree.numLeaves();
@@ -790,8 +790,7 @@ public final class GroupRefreshDeltaJoinUtil {
             }
             int[] sourceFields = toSourceFields(tree, leaf, fields);
             if (sourceFields != null
-                    && DeltaJoinUtil.isTableScanSupported(
-                            tree.leafScans.get(leaf), sourceFields)) {
+                    && DeltaJoinUtil.isTableScanSupported(tree.leafScans.get(leaf), sourceFields)) {
                 tree.groupReadFields[leaf] = fields;
             }
         }
@@ -1187,7 +1186,8 @@ public final class GroupRefreshDeltaJoinUtil {
                 int[] fields = tree.groupReadFields[leaf];
                 if (fields != null) {
                     JoinInfo info =
-                            JoinInfo.of(ImmutableIntList.of(keyRowFields), ImmutableIntList.of(fields));
+                            JoinInfo.of(
+                                    ImmutableIntList.of(keyRowFields), ImmutableIntList.of(fields));
                     groupReads.add(
                             new GroupRefreshDeltaJoinSpec.GroupRead(
                                     leaf, fields, lookupSpec(tree, info, leaf, cluster, true)));

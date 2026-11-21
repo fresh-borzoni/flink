@@ -288,6 +288,16 @@ public final class AnchorJoinTree implements Serializable {
         return used;
     }
 
+    /** The lookups of a delta step: both directions of every edge. */
+    public boolean[] lookupsUsedForDeltas(int numLookups) {
+        boolean[] used = new boolean[numLookups];
+        for (Edge edge : edges) {
+            used[edge.lookupLeft] = true;
+            used[edge.lookupRight] = true;
+        }
+        return used;
+    }
+
     private int[][] computePathsToAnchor() {
         int numLeaves = leafTypes.length;
         // adjacency: for each table, (edge, neighbour, lookup from this table to the neighbour)
@@ -405,8 +415,8 @@ public final class AnchorJoinTree implements Serializable {
     }
 
     /**
-     * The fields of a table equal to the anchor key fields of the next table towards the anchor,
-     * or null if the equality columns do not cover them or the types differ.
+     * The fields of a table equal to the anchor key fields of the next table towards the anchor, or
+     * null if the equality columns do not cover them or the types differ.
      */
     private @Nullable int[] anchorKeyFieldsIn(
             int neighbour, int[] neighbourFields, int[] anchorFields, int[] keyFieldsOfNext) {

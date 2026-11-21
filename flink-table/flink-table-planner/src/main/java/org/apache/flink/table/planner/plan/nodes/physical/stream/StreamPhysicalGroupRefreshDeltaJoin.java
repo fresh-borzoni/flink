@@ -100,6 +100,12 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
      */
     private final @Nullable StreamPhysicalGroupRefreshDeltaJoin alternative;
 
+    /**
+     * The epoch domain if the join reads its tables as of epochs of its sources, see {@link
+     * GroupRefreshOutputMode#VERSIONED}; null otherwise.
+     */
+    private final @Nullable String versionedDomain;
+
     public StreamPhysicalGroupRefreshDeltaJoin(
             RelOptCluster cluster,
             RelTraitSet traitSet,
@@ -117,6 +123,7 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                 outputUpsertKeys,
                 outputUniqueKeys,
                 null,
+                null,
                 null);
     }
 
@@ -129,7 +136,8 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
             Set<ImmutableBitSet> outputUpsertKeys,
             @Nullable Set<ImmutableBitSet> outputUniqueKeys,
             @Nullable ReadBack readBack,
-            @Nullable StreamPhysicalGroupRefreshDeltaJoin alternative) {
+            @Nullable StreamPhysicalGroupRefreshDeltaJoin alternative,
+            @Nullable String versionedDomain) {
         super(cluster, traitSet);
         this.inputs = inputs;
         this.rowType = rowType;
@@ -138,6 +146,7 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
         this.outputUniqueKeys = outputUniqueKeys;
         this.readBack = readBack;
         this.alternative = alternative;
+        this.versionedDomain = versionedDomain;
     }
 
     /** This join, with the same join grouped otherwise as an alternative. */
@@ -152,7 +161,8 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                 outputUpsertKeys,
                 outputUniqueKeys,
                 readBack,
-                alternative);
+                alternative,
+                versionedDomain);
     }
 
     /** The same join grouped otherwise, on the current inputs of this join; null if none. */
@@ -214,7 +224,46 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                 key,
                 key,
                 readBack,
+                null,
                 null);
+    }
+
+    /**
+     * This join on the given inputs, whose scans cut their changes into the epochs of the domain,
+     * reading its tables as of these epochs. With an output, it emits the rows of the output table,
+     * keyed by its primary key, as with read-back, but never reads them back.
+     */
+    public StreamPhysicalGroupRefreshDeltaJoin withVersioned(
+            String domain, List<RelNode> inputs, @Nullable ReadBack output) {
+        if (output == null) {
+            return new StreamPhysicalGroupRefreshDeltaJoin(
+                    getCluster(),
+                    getTraitSet(),
+                    inputs,
+                    getRowType(),
+                    tree,
+                    outputUpsertKeys,
+                    outputUniqueKeys,
+                    null,
+                    null,
+                    domain);
+        }
+        Set<ImmutableBitSet> key = Collections.singleton(ImmutableBitSet.of(output.primaryKey));
+        return new StreamPhysicalGroupRefreshDeltaJoin(
+                getCluster(),
+                getTraitSet(),
+                inputs,
+                output.projection.getOutputRowType(),
+                tree,
+                key,
+                key,
+                output,
+                null,
+                domain);
+    }
+
+    public @Nullable String getVersionedDomain() {
+        return versionedDomain;
     }
 
     public @Nullable ReadBack getReadBack() {
@@ -250,7 +299,8 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                 outputUpsertKeys,
                 outputUniqueKeys,
                 readBack,
-                alternative);
+                alternative,
+                versionedDomain);
     }
 
     @Override
@@ -270,7 +320,8 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
 
     /** Whether the given input must provide UPDATE_BEFORE and full deletes. */
     public boolean needsOldImages(int input) {
-        return tree.needsOldImages[input];
+        // read as of epochs, every change needs its row as of the epoch before
+        return tree.needsOldImages[input] || versionedDomain != null;
     }
 
     /** Upsert keys of the output: unique keys of the join that contain the anchor key. */
@@ -288,6 +339,9 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
      * key, possibly repeating an upsert.
      */
     public GroupRefreshOutputMode getOutputMode() {
+        if (versionedDomain != null) {
+            return GroupRefreshOutputMode.VERSIONED;
+        }
         if (readBack != null) {
             return GroupRefreshOutputMode.READ_BACK;
         }
@@ -364,12 +418,19 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                         readBack == null
                                 ? null
                                 : readBack.outputTable.getIdentifier().asSummaryString(),
-                        readBack != null)
+                        readBack != null && versionedDomain == null)
                 .itemIf(
                         "readableAfter",
                         readBack == null ? null : readBack.readYourWrites ? "write" : "checkpoint",
-                        readBack != null)
+                        readBack != null && versionedDomain == null)
+                .itemIf(
+                        "output",
+                        readBack == null
+                                ? null
+                                : readBack.outputTable.getIdentifier().asSummaryString(),
+                        readBack != null && versionedDomain != null)
                 .itemIf("projection", projectionString(), readBack != null)
+                .itemIf("epochs", versionedDomain, versionedDomain != null)
                 .item("select", String.join(", ", getRowType().getFieldNames()));
     }
 
@@ -448,9 +509,11 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
         // with read-back, the keys hold for the rows of the output table, and the operator keeps
         // its groups unique on the primary key of the table instead
         int[][] declaredKeys =
-                readBack != null
-                        ? new int[0][]
-                        : declared.stream().map(ImmutableBitSet::toArray).toArray(int[][]::new);
+                readBack == null
+                        ? declared.stream().map(ImmutableBitSet::toArray).toArray(int[][]::new)
+                        : versionedDomain != null
+                                ? new int[][] {readBack.primaryKey}
+                                : new int[0][];
         return new StreamExecGroupRefreshDeltaJoin(
                 unwrapTableConfig(this),
                 GroupRefreshDeltaJoinUtil.toSpec(tree, getCluster()),
@@ -461,7 +524,8 @@ public class StreamPhysicalGroupRefreshDeltaJoin extends AbstractRelNode
                 FlinkTypeFactory.toLogicalRowType(getRowType()),
                 getRelDetailedDescription(),
                 readBack == null ? null : toReadBackSpec(readBack),
-                dropsUpdateBefore());
+                dropsUpdateBefore(),
+                versionedDomain);
     }
 
     /** Whether the consumer requires only the new row of an update. */

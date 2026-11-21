@@ -97,7 +97,10 @@ class TableSourceTable(
   private def mergeSpecs(
       original: Array[SourceAbilitySpec],
       newSpec: Array[SourceAbilitySpec]): Array[SourceAbilitySpec] = {
-    original.filter(old => !newSpec.exists(n => old.getClass == n.getClass)) ++ newSpec
+    // a table restored from a compiled plan may have no specs
+    Option(original)
+      .getOrElse(Array.empty[SourceAbilitySpec])
+      .filter(old => !newSpec.exists(n => old.getClass == n.getClass)) ++ newSpec
   }
 
   /**

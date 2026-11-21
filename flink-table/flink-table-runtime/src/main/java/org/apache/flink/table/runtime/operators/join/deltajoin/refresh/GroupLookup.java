@@ -28,6 +28,7 @@ import org.apache.flink.streaming.api.functions.async.CollectionSupplier;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.table.connector.source.lookup.SupportsPagedLookup;
+import org.apache.flink.table.connector.source.lookup.SupportsVersionedLookup;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.conversion.DataStructureConverter;
@@ -178,6 +179,20 @@ public final class GroupLookup implements Serializable {
                 pageKeyGetters[i] = RowData.createFieldGetter(pageKeyTypes[i], pageKeyFields[i]);
             }
         }
+    }
+
+    /**
+     * The lookup function of a generated fetcher if it implements {@link SupportsVersionedLookup},
+     * else null. The fetcher opens and closes it.
+     */
+    public static @Nullable SupportsVersionedLookup versionedFunctionOrNull(
+            GeneratedFunction<?> fetcher) {
+        for (Object reference : fetcher.getReferences()) {
+            if (reference instanceof SupportsVersionedLookup) {
+                return (SupportsVersionedLookup) reference;
+            }
+        }
+        return null;
     }
 
     /**

@@ -21,6 +21,7 @@ package org.apache.flink.table.planner.runtime.stream.sql;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.ExplainDetail;
 import org.apache.flink.table.api.PlanReference;
 import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.TableDescriptor;
@@ -84,6 +85,8 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
     private @Nullable String expectedMode;
     // a part that the optimized plan must contain
     private @Nullable String expectedInPlan;
+    // an operator that the execution plan must contain
+    private @Nullable String expectedOperator;
 
     @BeforeEach
     void setup() {
@@ -303,6 +306,115 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
                     .as("run %s restored from a checkpoint", run)
                     .isTrue();
         }
+    }
+
+    /** Trees that read their tables as of the epochs of their sources, all join types. */
+    @Test
+    void testVersionedTreesConverge() throws Exception {
+        readAsOfEpochs();
+        for (int run = 0; run < Math.max(RUNS, 18); run++) {
+            Random random = new Random(31000 + run);
+            String j1 = JOIN_TYPES[run % 3];
+            String j2 = JOIN_TYPES[(run / 3) % 3];
+            String x = (run / 9) % 2 == 0 ? "a" : "b";
+            String query =
+                    String.format(
+                            "SELECT a_id, b_id, c_id, a_v, b_v, c_v FROM A %s B ON a_k1 = b_k1"
+                                    + " %s C ON %s_k2 = c_k2",
+                            j1, j2, x);
+            runAndCompare(random, query, null, run);
+        }
+    }
+
+    /** Versioned trees restored from checkpoints, with N:M edges on mutable keys. */
+    @Test
+    void testVersionedTreesRecoverFromFailures() throws Exception {
+        tEnv.getConfig().set("execution.checkpointing.interval", "20 ms");
+        tEnv.getConfig().set("restart-strategy.type", "fixed-delay");
+        tEnv.getConfig().set("restart-strategy.fixed-delay.attempts", "3");
+        tEnv.getConfig().set("restart-strategy.fixed-delay.delay", "10 ms");
+        readAsOfEpochs();
+        for (int run = 0; run < RUNS; run++) {
+            Random random = new Random(32000 + run);
+            failAfter = 3 + random.nextInt(10);
+            String j1 = JOIN_TYPES[random.nextInt(3)];
+            String j2 = JOIN_TYPES[random.nextInt(3)];
+            String x = random.nextBoolean() ? "a" : "b";
+            String query =
+                    String.format(
+                            "SELECT a_id, b_id, c_id, a_v, b_v, c_v FROM A %s B ON a_k1 = b_k1"
+                                    + " %s C ON %s_k2 = c_k2",
+                            j1, j2, x);
+            runAndCompare(random, query, null, run);
+            assertThat(restoredFromCheckpoint)
+                    .as("run %s restored from a checkpoint", run)
+                    .isTrue();
+        }
+    }
+
+    /**
+     * Versioned trees restored from checkpoints into a sink that keeps what the failed run wrote.
+     */
+    @Test
+    void testVersionedTreesRecoverIntoSinkThatIsNotRolledBack() throws Exception {
+        tEnv.getConfig().set("execution.checkpointing.interval", "20 ms");
+        tEnv.getConfig().set("restart-strategy.type", "fixed-delay");
+        tEnv.getConfig().set("restart-strategy.fixed-delay.attempts", "3");
+        tEnv.getConfig().set("restart-strategy.fixed-delay.delay", "10 ms");
+        readAsOfEpochs();
+        sinkInStore = true;
+        // the join emits the rows of the output table by its key: no materialization at the sink
+        expectedInPlan = "output=[";
+        for (int run = 0; run < RUNS; run++) {
+            Random random = new Random(33000 + run);
+            failAfter = 3 + random.nextInt(10);
+            String j1 = random.nextBoolean() ? "JOIN" : "LEFT JOIN";
+            String j2 = random.nextBoolean() ? "JOIN" : "LEFT JOIN";
+            String x = random.nextBoolean() ? "a" : "b";
+            String query =
+                    String.format(
+                            "SELECT a_id, b_v, c_v FROM A %s B ON a_k1 = b_id %s C ON %s_k2 = c_id",
+                            j1, j2, x);
+            runAndCompare(random, query, "a_id", run);
+            assertThat(restoredFromCheckpoint)
+                    .as("run %s restored from a checkpoint", run)
+                    .isTrue();
+        }
+    }
+
+    /** Versioned chains, stars and bushy trees of four tables. */
+    @Test
+    void testVersionedFourWayTreesConverge() throws Exception {
+        readAsOfEpochs();
+        String[] shapes = {
+            // chain A - B - C - D
+            "SELECT a_id, b_id, c_id, d_id, a_v, b_v, c_v, d_v FROM A %s B ON a_k1 = b_k1"
+                    + " %s C ON b_k2 = c_k1 %s D ON c_k2 = d_k1",
+            // star around A
+            "SELECT a_id, b_id, c_id, d_id, a_v, b_v, c_v, d_v FROM A %s B ON a_k1 = b_k1"
+                    + " %s C ON a_k2 = c_k1 %s D ON a_k1 = d_k1",
+            // A - B, B - C, B - D
+            "SELECT a_id, b_id, c_id, d_id, a_v, b_v, c_v, d_v FROM A %s B ON a_k1 = b_k1"
+                    + " %s C ON b_k2 = c_k1 %s D ON b_k1 = d_k1"
+        };
+        for (int run = 0; run < Math.max(RUNS, 27); run++) {
+            Random random = new Random(37000 + run);
+            String j1 = random.nextBoolean() ? "JOIN" : "LEFT JOIN";
+            String j2 = random.nextBoolean() ? "JOIN" : "LEFT JOIN";
+            String j3 = random.nextBoolean() ? "JOIN" : "LEFT JOIN";
+            String query = String.format(shapes[run % shapes.length], j1, j2, j3);
+            runAndCompare(random, query, null, run);
+        }
+    }
+
+    private void readAsOfEpochs() {
+        tEnv.getConfig()
+                .set(
+                        OptimizerConfigOptions.TABLE_OPTIMIZER_DELTA_JOIN_GROUP_REFRESH_VERSIONED,
+                        OptimizerConfigOptions.DeltaJoinVersioned.FORCE);
+        expectedMode = "VERSIONED";
+        expectedInPlan = "epochs=[";
+        expectedOperator = "GroupRefreshDeltaJoinDelta";
     }
 
     /**
@@ -768,7 +880,25 @@ class AnchorDeltaJoinITCase extends StreamAbstractTestBase {
         if (expectedInPlan != null) {
             assertThat(plan).as(query).contains(expectedInPlan);
         }
-        tEnv.executeSql(insert).await();
+        if ("VERSIONED".equals(expectedMode)) {
+            assertThat(plan).as(query).contains("epochs=[");
+            if (sinkInStore) {
+                assertThat(plan).as(query).doesNotContain("upsertMaterialize=[true]");
+            }
+        }
+        if (expectedOperator != null) {
+            assertThat(tEnv.explainSql(insert, ExplainDetail.JSON_EXECUTION_PLAN))
+                    .as(query)
+                    .contains(expectedOperator);
+        }
+        if ("VERSIONED".equals(expectedMode) && run % 3 == 2) {
+            // the epochs of the scans and the domain of the join survive a compiled plan
+            String json = tEnv.compilePlanSql(insert).asJsonString();
+            assertThat(json).contains("\"versionedDomain\"").contains("\"Epochs\"");
+            tEnv.loadPlan(PlanReference.fromJsonString(json)).execute().await();
+        } else {
+            tEnv.executeSql(insert).await();
+        }
 
         restoredFromCheckpoint = SharedStoreTableFactory.restoredFromCheckpoint(STORE, "A");
         List<String> actual =

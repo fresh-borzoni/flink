@@ -576,8 +576,8 @@ class GroupRefreshDeltaJoinTest extends TableTestBase {
 
     /**
      * Every table of a chain is keyed by the keys of its parent and its own id, and joins its
-     * parent on the parent's key. The output key holds the id of every table once: a row of a
-     * child exists only where its parent ids equal the parent's, which the output key holds.
+     * parent on the parent's key. The output key holds the id of every table once: a row of a child
+     * exists only where its parent ids equal the parent's, which the output key holds.
      */
     @Test
     void testReadBackOfChainKeyedByParentKeys() {

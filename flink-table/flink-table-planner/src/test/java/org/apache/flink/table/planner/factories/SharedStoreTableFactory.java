@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.planner.factories;
 
+import org.apache.flink.api.common.eventtime.Watermark;
 import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
@@ -46,8 +47,10 @@ import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.LookupTableSource;
 import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.connector.source.SourceProvider;
+import org.apache.flink.table.connector.source.abilities.SupportsEpochs;
 import org.apache.flink.table.connector.source.lookup.AsyncLookupFunctionProvider;
 import org.apache.flink.table.connector.source.lookup.SupportsPagedLookup;
+import org.apache.flink.table.connector.source.lookup.SupportsVersionedLookup;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.factories.DynamicTableSinkFactory;
@@ -145,6 +148,12 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
     private static final Map<String, AtomicLong> LOOKUPS = new ConcurrentHashMap<>();
     // the rows written into sink tables, by store and table, keyed by the primary key
     private static final Map<String, Map<String, Map<Row, Row>>> SINKS = new ConcurrentHashMap<>();
+
+    /** Per store and epoch domain, when epoch 0 started: every source counts epochs from it. */
+    private static final Map<String, Long> EPOCH_ZERO = new ConcurrentHashMap<>();
+
+    /** The length of an epoch. */
+    private static final long EPOCH_MILLIS = 10;
 
     /** Lookups read in more than one page. */
     private static final Map<String, AtomicLong> PAGED_LOOKUPS = new ConcurrentHashMap<>();
@@ -260,6 +269,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
     }
 
     public static void clear(String store) {
+        EPOCH_ZERO.keySet().removeIf(key -> key.startsWith(store + "/"));
         STORES.remove(store);
         LOOKUPS.remove(store);
         PAGED_LOOKUPS.remove(store);
@@ -325,6 +335,11 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         String holdUntilTable;
         // the changes from this position on wait until the table is resumed
         int pauseAt = -1;
+        // per epoch domain, the position after the last change of every epoch a source of the
+        // table ended; a restored source ends them at the same positions again
+        final Map<String, List<Integer>> epochEnds = new HashMap<>();
+        // the epoch domains whose source emitted the whole script and ended its last epoch
+        final Set<String> epochsDone = new HashSet<>();
 
         Table(List<Change> script) {
             this.script = script;
@@ -586,7 +601,8 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         }
     }
 
-    private static final class StoreTableSource implements ScanTableSource, LookupTableSource {
+    private static final class StoreTableSource
+            implements ScanTableSource, LookupTableSource, SupportsEpochs {
 
         private final String store;
         private final String table;
@@ -595,6 +611,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         private final boolean staleReads;
         private final int failAfter;
         private final boolean insertOnly;
+        private @Nullable String epochDomain;
 
         private StoreTableSource(
                 String store,
@@ -619,8 +636,15 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         }
 
         @Override
+        public boolean applyEpochs(String domain) {
+            epochDomain = domain;
+            return true;
+        }
+
+        @Override
         public ScanRuntimeProvider getScanRuntimeProvider(ScanContext context) {
-            return SourceProvider.of(new StoreSource(store, table, maxDelayMs, failAfter), 1);
+            return SourceProvider.of(
+                    new StoreSource(store, table, maxDelayMs, failAfter, epochDomain), 1);
         }
 
         @Override
@@ -636,13 +660,23 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                             keyFields,
                             maxDelayMs,
                             staleReads,
-                            context.requiresReadYourWrites()));
+                            context.requiresReadYourWrites(),
+                            epochDomain));
         }
 
         @Override
         public DynamicTableSource copy() {
-            return new StoreTableSource(
-                    store, table, primaryKey, maxDelayMs, staleReads, failAfter, insertOnly);
+            StoreTableSource copy =
+                    new StoreTableSource(
+                            store,
+                            table,
+                            primaryKey,
+                            maxDelayMs,
+                            staleReads,
+                            failAfter,
+                            insertOnly);
+            copy.epochDomain = epochDomain;
+            return copy;
         }
 
         @Override
@@ -665,12 +699,19 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         private final String table;
         private final int maxDelayMs;
         private final int failAfter;
+        private final @Nullable String epochDomain;
 
-        private StoreSource(String store, String table, int maxDelayMs, int failAfter) {
+        private StoreSource(
+                String store,
+                String table,
+                int maxDelayMs,
+                int failAfter,
+                @Nullable String epochDomain) {
             this.store = store;
             this.table = table;
             this.maxDelayMs = maxDelayMs;
             this.failAfter = failAfter;
+            this.epochDomain = epochDomain;
         }
 
         @Override
@@ -702,7 +743,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
 
         @Override
         public SourceReader<RowData, StoreSplit> createReader(SourceReaderContext context) {
-            return new StoreReader(context, store, table, maxDelayMs, failAfter);
+            return new StoreReader(context, store, table, maxDelayMs, failAfter, epochDomain);
         }
     }
 
@@ -817,6 +858,13 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         private final int failAfter;
         private final Random random;
         private final ScheduledExecutorService timer;
+        private final @Nullable String epochDomain;
+
+        /** With epochs: the open epoch, or -1 until it is known after a restore. */
+        private int epoch = -1;
+
+        /** With epochs: the position the open epoch started at. */
+        private int epochStart;
 
         private @Nullable StoreSplit split;
         private int position;
@@ -829,8 +877,10 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                 String store,
                 String table,
                 int maxDelayMs,
-                int failAfter) {
+                int failAfter,
+                @Nullable String epochDomain) {
             this.context = context;
+            this.epochDomain = epochDomain;
             this.store = store;
             this.table = table;
             this.maxDelayMs = maxDelayMs;
@@ -856,7 +906,12 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                 return noMoreSplits ? InputStatus.END_OF_INPUT : waitFor(-1);
             }
             Table t = table(store, table);
-            if (position >= t.script.size()) {
+            if (epochDomain != null) {
+                InputStatus status = pollEpochs(output, t);
+                if (status != null) {
+                    return status;
+                }
+            } else if (position >= t.script.size()) {
                 return InputStatus.END_OF_INPUT;
             }
             int holdFrom;
@@ -868,16 +923,16 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                 pauseAt = t.pauseAt;
             }
             if (pauseAt >= 0 && position >= pauseAt) {
-                return waitFor(5);
+                return stall(output, t);
             }
             if (holdFrom >= 0 && position >= holdFrom && !fullyApplied(store, holdUntilTable)) {
-                return waitFor(5);
+                return stall(output, t);
             }
             synchronized (t) {
                 if (failAfter >= 0 && position >= failAfter && !t.failed) {
                     if (!checkpointCompleted) {
                         // fail only after a checkpoint, so that the restore uses its state
-                        return waitFor(5);
+                        return stall(output, t);
                     }
                     t.failed = true;
                     throw new RuntimeException("Injected failure of the source of " + table);
@@ -894,10 +949,99 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                 }
             }
             for (RowData row : t.changelog.get(position)) {
-                output.collect(row);
+                if (epochDomain != null) {
+                    // the epoch of a change is the timestamp of its records
+                    output.collect(row, epoch);
+                } else {
+                    output.collect(row);
+                }
             }
             position++;
             return waitFor(maxDelayMs > 0 ? random.nextInt(maxDelayMs + 1) : 0);
+        }
+
+        /**
+         * Ends epochs: an epoch recorded before ends where it ended, and the open one ends at a
+         * random position or at the end of the script, with a watermark of its number. Returns null
+         * if the change at the position belongs to the open epoch.
+         */
+        private @Nullable InputStatus pollEpochs(ReaderOutput<RowData> output, Table t) {
+            int size = t.script.size();
+            synchronized (t) {
+                List<Integer> ends =
+                        t.epochEnds.computeIfAbsent(epochDomain, d -> new ArrayList<>());
+                if (epoch < 0) {
+                    // at the start or after a restore: the first epoch that did not end before
+                    // the position, announced by a watermark of the epoch before it
+                    epoch = 0;
+                    while (epoch < ends.size() && ends.get(epoch) < position) {
+                        epoch++;
+                    }
+                    if (epoch == ends.size()) {
+                        // the epochs the clock passed before the source started hold no change
+                        while (ends.size() < clockEpoch()) {
+                            ends.add(position);
+                        }
+                        epoch = ends.size();
+                    }
+                    epochStart = position;
+                    output.emitWatermark(new Watermark(epoch - 1));
+                    return InputStatus.MORE_AVAILABLE;
+                }
+                if (epoch < ends.size()) {
+                    if (position < ends.get(epoch)) {
+                        return null;
+                    }
+                    output.emitWatermark(new Watermark(epoch));
+                    epoch++;
+                    epochStart = position;
+                    return InputStatus.MORE_AVAILABLE;
+                }
+                boolean atEnd = position >= size;
+                if (atEnd || clockEpoch() > epoch) {
+                    endEpochsUntil(output, ends, Math.max(epoch, clockEpoch() - 1));
+                    if (atEnd) {
+                        t.epochsDone.add(epochDomain);
+                        return InputStatus.END_OF_INPUT;
+                    }
+                    return InputStatus.MORE_AVAILABLE;
+                }
+                return null;
+            }
+        }
+
+        /** The epoch of the shared clock: every source of the domain counts the same epochs. */
+        private long clockEpoch() {
+            long zero =
+                    EPOCH_ZERO.computeIfAbsent(
+                            store + "/" + epochDomain, d -> System.currentTimeMillis());
+            return (System.currentTimeMillis() - zero) / EPOCH_MILLIS;
+        }
+
+        /** Ends the open epoch at the position, and the epochs up to the last, which are empty. */
+        private void endEpochsUntil(ReaderOutput<RowData> output, List<Integer> ends, long last) {
+            while (ends.size() <= last) {
+                ends.add(position);
+            }
+            output.emitWatermark(new Watermark(last));
+            epoch = (int) last + 1;
+            epochStart = position;
+        }
+
+        /**
+         * Waits a little before the change at the position. With epochs, the open epoch ends first:
+         * lookups that read as of it must not wait for a source that stalls.
+         */
+        private InputStatus stall(ReaderOutput<RowData> output, Table t) {
+            if (epochDomain != null && epoch >= 0) {
+                synchronized (t) {
+                    List<Integer> ends = t.epochEnds.get(epochDomain);
+                    if (epoch == ends.size() && clockEpoch() > epoch) {
+                        endEpochsUntil(output, ends, clockEpoch() - 1);
+                    }
+                }
+            }
+            return waitFor(5);
         }
 
         /** Returns NOTHING_AVAILABLE until the delay passed, or until notified if negative. */
@@ -958,7 +1102,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
      * the current rows of the key, as a lookup does, and the pages hand them over.
      */
     public static final class StoreLookup extends AsyncLookupFunction
-            implements SupportsPagedLookup {
+            implements SupportsPagedLookup, SupportsVersionedLookup {
 
         private static final long serialVersionUID = 1L;
         private static final AtomicInteger THREADS = new AtomicInteger();
@@ -969,6 +1113,7 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
         private final int maxDelayMs;
         private final boolean staleReads;
         private final boolean requiresWriter;
+        private final @Nullable String epochDomain;
 
         private transient ExecutorService executor;
         private transient Random random;
@@ -979,7 +1124,9 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                 int[] keyFields,
                 int maxDelayMs,
                 boolean staleReads,
-                boolean requiresWriter) {
+                boolean requiresWriter,
+                @Nullable String epochDomain) {
+            this.epochDomain = epochDomain;
             this.store = store;
             this.table = table;
             this.keyFields = keyFields;
@@ -1068,6 +1215,55 @@ public class SharedStoreTableFactory implements DynamicTableSourceFactory, Dynam
                         }
                     },
                     executor);
+        }
+
+        @Override
+        public CompletableFuture<Collection<RowData>> asyncLookupAsOf(RowData keyRow, long epoch) {
+            Preconditions.checkState(
+                    epochDomain != null, "The lookup of %s applied no epochs.", table);
+            LOOKUPS.computeIfAbsent(store, s -> new AtomicLong()).incrementAndGet();
+            Object[] key = new Object[keyFields.length];
+            for (int i = 0; i < key.length; i++) {
+                key[i] = ((GenericRowData) keyRow).getField(i);
+            }
+            CompletableFuture<Collection<RowData>> result = new CompletableFuture<>();
+            CompletableFuture.runAsync(() -> readAsOf(key, epoch, result), executor);
+            return result;
+        }
+
+        /** Reads the rows of the key as of the end of the epoch, once a source ended it. */
+        private void readAsOf(
+                Object[] key, long epoch, CompletableFuture<Collection<RowData>> result) {
+            Table t = table(store, table);
+            synchronized (t) {
+                List<Integer> ends = t.epochEnds.getOrDefault(epochDomain, Collections.emptyList());
+                int end = -1;
+                if (epoch < 0) {
+                    end = 0;
+                } else if (epoch < ends.size()) {
+                    end = ends.get((int) epoch);
+                } else if (t.epochsDone.contains(epochDomain)) {
+                    end = t.script.size();
+                }
+                if (end >= 0) {
+                    List<RowData> matches = new ArrayList<>();
+                    for (GenericRowData row : t.stateAfter(end).values()) {
+                        boolean match = true;
+                        for (int i = 0; i < key.length && match; i++) {
+                            match = Objects.equals(row.getField(keyFields[i]), key[i]);
+                        }
+                        if (match) {
+                            matches.add(row);
+                        }
+                    }
+                    result.complete(matches);
+                    return;
+                }
+            }
+            // the epoch did not end yet: read again soon
+            CompletableFuture.runAsync(
+                    () -> readAsOf(key, epoch, result),
+                    CompletableFuture.delayedExecutor(2, TimeUnit.MILLISECONDS, executor));
         }
 
         @Override

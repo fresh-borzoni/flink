@@ -24,12 +24,14 @@ import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.functions.async.AsyncFunction;
+import org.apache.flink.streaming.api.operators.KeyedProcessOperator;
 import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.streaming.api.transformations.PartitionTransformation;
 import org.apache.flink.streaming.api.transformations.UnionTransformation;
 import org.apache.flink.streaming.runtime.partitioner.KeyGroupStreamPartitioner;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
+import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.lookup.SupportsPagedLookup;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.AsyncTableFunction;
@@ -39,6 +41,8 @@ import org.apache.flink.table.planner.codegen.FilterCodeGenerator;
 import org.apache.flink.table.planner.codegen.FunctionCallCodeGenerator;
 import org.apache.flink.table.planner.codegen.LookupJoinCodeGenerator;
 import org.apache.flink.table.planner.delegation.PlannerBase;
+import org.apache.flink.table.planner.plan.abilities.source.EpochsSpec;
+import org.apache.flink.table.planner.plan.abilities.source.SourceAbilitySpec;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecEdge;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -62,14 +66,17 @@ import org.apache.flink.table.runtime.generated.GeneratedFunction;
 import org.apache.flink.table.runtime.generated.GeneratedJoinCondition;
 import org.apache.flink.table.runtime.keyselector.RowDataKeySelector;
 import org.apache.flink.table.runtime.operators.join.FlinkJoinType;
+import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.AnchorDeltaOperatorFactory;
 import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.AnchorGroupRefreshOperatorFactory;
 import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.AnchorJoinTree;
 import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.AnchorLocateOperatorFactory;
 import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.AnchorLookupSpec;
 import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.AnchorNotes;
+import org.apache.flink.table.runtime.operators.join.deltajoin.anchor.DeltaApplyFunction;
 import org.apache.flink.table.runtime.operators.join.deltajoin.refresh.DropUnchangedUpdatesOperator;
 import org.apache.flink.table.runtime.operators.join.deltajoin.refresh.GroupRefreshOutputMode;
 import org.apache.flink.table.runtime.operators.join.deltajoin.refresh.GroupRefreshSpec;
+import org.apache.flink.table.runtime.operators.join.deltajoin.refresh.GroupRows;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
@@ -144,6 +151,7 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
     public static final String FIELD_NAME_DECLARED_KEYS = "declaredKeys";
     public static final String FIELD_NAME_READ_BACK = "readBack";
     public static final String FIELD_NAME_DROP_UPDATE_BEFORE = "dropUpdateBefore";
+    public static final String FIELD_NAME_VERSIONED_DOMAIN = "versionedDomain";
 
     @JsonProperty(FIELD_NAME_SPEC)
     private final GroupRefreshDeltaJoinSpec spec;
@@ -170,6 +178,11 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
     @JsonInclude(JsonInclude.Include.NON_DEFAULT)
     private final boolean dropUpdateBefore;
 
+    /** The domain of the epochs the tables are read as of, for the VERSIONED mode. */
+    @JsonProperty(FIELD_NAME_VERSIONED_DOMAIN)
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private final @Nullable String versionedDomain;
+
     public StreamExecGroupRefreshDeltaJoin(
             ReadableConfig tableConfig,
             GroupRefreshDeltaJoinSpec spec,
@@ -180,7 +193,8 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
             RowType outputType,
             String description,
             @Nullable DeltaJoinReadBackSpec readBack,
-            boolean dropUpdateBefore) {
+            boolean dropUpdateBefore,
+            @Nullable String versionedDomain) {
         this(
                 ExecNodeContext.newNodeId(),
                 ExecNodeContext.newContext(StreamExecGroupRefreshDeltaJoin.class),
@@ -194,7 +208,8 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
                 outputType,
                 description,
                 readBack,
-                dropUpdateBefore);
+                dropUpdateBefore,
+                versionedDomain);
     }
 
     @JsonCreator
@@ -210,11 +225,20 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
             @JsonProperty(FIELD_NAME_OUTPUT_TYPE) RowType outputType,
             @JsonProperty(FIELD_NAME_DESCRIPTION) String description,
             @Nullable @JsonProperty(FIELD_NAME_READ_BACK) DeltaJoinReadBackSpec readBack,
-            @JsonProperty(FIELD_NAME_DROP_UPDATE_BEFORE) boolean dropUpdateBefore) {
+            @JsonProperty(FIELD_NAME_DROP_UPDATE_BEFORE) boolean dropUpdateBefore,
+            @Nullable @JsonProperty(FIELD_NAME_VERSIONED_DOMAIN) String versionedDomain) {
         super(id, context, persistedConfig, inputProperties, outputType, description);
         Preconditions.checkArgument(
-                (outputMode == GroupRefreshOutputMode.READ_BACK) == (readBack != null),
-                "The READ_BACK mode, and only it, needs the output table.");
+                (outputMode == GroupRefreshOutputMode.VERSIONED) == (versionedDomain != null),
+                "The VERSIONED mode, and only it, needs an epoch domain.");
+        Preconditions.checkArgument(
+                outputMode != GroupRefreshOutputMode.READ_BACK || readBack != null,
+                "The READ_BACK mode needs the output table.");
+        Preconditions.checkArgument(
+                readBack == null
+                        || outputMode == GroupRefreshOutputMode.READ_BACK
+                        || outputMode == GroupRefreshOutputMode.VERSIONED,
+                "Only the READ_BACK and VERSIONED modes emit the rows of an output table.");
         Preconditions.checkArgument(
                 inputProperties.size() == spec.getLeafTypes().size(),
                 "Expected one input per table.");
@@ -224,11 +248,16 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
         this.declaredKeys = checkNotNull(declaredKeys);
         this.readBack = readBack;
         this.dropUpdateBefore = dropUpdateBefore;
+        this.versionedDomain = versionedDomain;
     }
 
     @Override
     protected Transformation<RowData> translateToPlanInternal(
             PlannerBase planner, ExecNodeConfig config) {
+        Preconditions.checkState(
+                versionedDomain == null
+                        || spec.getGrouping() == GroupRefreshDeltaJoinSpec.Grouping.ANCHOR,
+                "Only joins grouped by an anchor read their tables as of epochs.");
         if (spec.getGrouping() == GroupRefreshDeltaJoinSpec.Grouping.JOIN_KEY) {
             RowType leftType = spec.getLeafTypes().get(0);
             RowType rightType = spec.getLeafTypes().get(1);
@@ -407,6 +436,18 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
         long timeoutMs =
                 config.get(ExecutionConfigOptions.TABLE_EXEC_ASYNC_LOOKUP_TIMEOUT).toMillis();
         int capacity = config.get(ExecutionConfigOptions.TABLE_EXEC_ASYNC_LOOKUP_BUFFER_CAPACITY);
+        if (versionedDomain != null) {
+            return translateVersioned(
+                    planner,
+                    config,
+                    tree,
+                    lookupSpecs,
+                    conditions,
+                    filters,
+                    anchorKeyType,
+                    timeoutMs,
+                    capacity);
+        }
 
         // tables whose changes refresh only their own lines send the changed rows along: that
         // needs single rows of the output, read by row keys that every line knows by itself
@@ -510,6 +551,106 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
     }
 
     /**
+     * Reads the tables as of the epochs of the sources: a delta step chained to every input emits
+     * the lines its changes add and remove, and an apply step keyed by the output key sums them per
+     * epoch.
+     */
+    private Transformation<RowData> translateVersioned(
+            PlannerBase planner,
+            ExecNodeConfig config,
+            AnchorJoinTree tree,
+            AnchorLookupSpec[] lookupSpecs,
+            GeneratedJoinCondition[] conditions,
+            GeneratedFilterCondition[][] filters,
+            RowType anchorKeyType,
+            long timeoutMs,
+            int capacity) {
+        ClassLoader classLoader = planner.getFlinkContext().getClassLoader();
+        AnchorJoinTree.FieldMap joined = tree.getNode(tree.getRootNode()).getOutput();
+        GroupRefreshSpec refreshSpec =
+                refreshSpec(
+                        planner,
+                        config,
+                        joined.getLeaves(),
+                        joined.getFields(),
+                        anchorKeyType,
+                        null,
+                        false);
+        RowType outputType = (RowType) getOutputType();
+        RowType rowKeyType = GroupRows.rowKeyType(refreshSpec);
+        RowType entryType = AnchorDeltaOperatorFactory.entryType(rowKeyType, outputType);
+        List<Transformation<RowData>> deltas = new ArrayList<>();
+        for (int i = 0; i < tree.getNumLeaves(); i++) {
+            if (uniqueKeyOf(i).length == 0) {
+                throw new ValidationException(
+                        String.format(
+                                "A delta join that reads its tables as of epochs needs a unique"
+                                        + " key of input #%s.",
+                                i));
+            }
+            ExecEdge inputEdge = getInputEdges().get(i);
+            Transformation<RowData> input = withoutUnchangedUpdates(planner, config, i);
+            deltas.add(
+                    ExecNodeUtil.createOneInputTransformation(
+                            input,
+                            createTransformationMeta(
+                                    LOCATE_TRANSFORMATION + "-" + inputLetters(i),
+                                    "GroupRefreshDeltaJoinDelta",
+                                    "GroupRefreshDeltaJoinDelta(input=[#" + i + "])",
+                                    config),
+                            new AnchorDeltaOperatorFactory(
+                                    tree,
+                                    lookupSpecs,
+                                    conditions,
+                                    filters,
+                                    refreshSpec,
+                                    i,
+                                    (RowType) inputEdge.getOutputType(),
+                                    uniqueKeyOf(i),
+                                    timeoutMs,
+                                    capacity),
+                            InternalTypeInfo.of(entryType),
+                            input.getParallelism(),
+                            0,
+                            false));
+        }
+        int[] keyFields = new int[rowKeyType.getFieldCount()];
+        for (int k = 0; k < keyFields.length; k++) {
+            keyFields[k] = 1 + k;
+        }
+        RowDataKeySelector keySelector =
+                KeySelectorUtil.getRowDataSelector(
+                        classLoader, keyFields, InternalTypeInfo.of(entryType));
+        PartitionTransformation<RowData> exchange =
+                new PartitionTransformation<>(
+                        new UnionTransformation<>(deltas),
+                        new KeyGroupStreamPartitioner<>(
+                                keySelector, DEFAULT_LOWER_BOUND_MAX_PARALLELISM));
+        exchange.setParallelism(ExecutionConfig.PARALLELISM_DEFAULT);
+        OneInputTransformation<RowData, RowData> apply =
+                ExecNodeUtil.createOneInputTransformation(
+                        exchange,
+                        createTransformationMeta(
+                                REFRESH_TRANSFORMATION,
+                                "GroupRefreshDeltaJoinApply",
+                                "GroupRefreshDeltaJoinApply(mode=[" + outputMode + "])",
+                                config),
+                        new KeyedProcessOperator<>(
+                                new DeltaApplyFunction(
+                                        entryType,
+                                        rowKeyType.getFieldCount(),
+                                        outputType,
+                                        !dropUpdateBefore)),
+                        InternalTypeInfo.of(outputType),
+                        ExecutionConfig.PARALLELISM_DEFAULT,
+                        0,
+                        false);
+        apply.setStateKeySelector(keySelector);
+        apply.setStateKeyType(keySelector.getProducedType());
+        return apply;
+    }
+
+    /**
      * The common part of both groupings: how the joined rows, read through the given field map,
      * become emitted rows, and how the operator knows what it emitted before.
      */
@@ -557,7 +698,21 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
                                                 .TABLE_EXEC_DELTA_JOIN_GROUP_REFRESH_MAX_GROUP_SIZE))
                         .pageSize(pageSize(config))
                         .emitUpdateBefore(!dropUpdateBefore);
-        if (readBack != null) {
+        if (readBack != null && outputMode == GroupRefreshOutputMode.VERSIONED) {
+            // the rows of the output table, keyed by its primary key, never read back
+            builder.projection(
+                            DeltaJoinReadBackUtil.generateOutputCalc(
+                                    config,
+                                    classLoader,
+                                    readBack,
+                                    outputType,
+                                    planner.getTypeFactory()))
+                    .outputKey(
+                            KeySelectorUtil.getRowDataSelector(
+                                    classLoader,
+                                    readBack.getOutputKey(),
+                                    InternalTypeInfo.of(outputType)));
+        } else if (readBack != null) {
             builder.projection(
                             DeltaJoinReadBackUtil.generateOutputCalc(
                                     config,
@@ -694,7 +849,7 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
     }
 
     /** Generates the fetcher and the calc of one lookup. */
-    private static AnchorLookupSpec lookup(
+    private AnchorLookupSpec lookup(
             PlannerBase planner,
             ExecNodeConfig config,
             FlinkTypeFactory typeFactory,
@@ -708,6 +863,17 @@ public class StreamExecGroupRefreshDeltaJoin extends ExecNodeBase<RowData>
                         lookupSpec
                                 .getLookupTable()
                                 .getTemporalTable(planner.getFlinkContext(), typeFactory);
+        if (versionedDomain != null) {
+            // the lookups read as of the epochs of the scans of the same domain
+            DynamicTableSource versioned = lookupTable.tableSource().copy();
+            EpochsSpec epochs = new EpochsSpec(versionedDomain);
+            epochs.apply(versioned, null);
+            lookupTable =
+                    lookupTable.copy(
+                            versioned,
+                            lookupTable.getStatistic(),
+                            new SourceAbilitySpec[] {epochs});
+        }
         Map<Integer, FunctionCallUtil.FunctionParam> lookupKeyMap = lookupSpec.getLookupKeyMap();
         AsyncTableFunction<?> lookupFunction =
                 DeltaJoinUtil.getUnwrappedAsyncLookupFunction(

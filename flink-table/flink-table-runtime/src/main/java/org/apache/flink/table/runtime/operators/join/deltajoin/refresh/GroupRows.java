@@ -65,7 +65,7 @@ import java.util.StringJoiner;
  * <p>Rows are normalized to {@link BinaryRowData} with {@link RowKind#INSERT}, so that equal rows
  * compare equal. Not thread safe.
  */
-final class GroupRows {
+public final class GroupRows {
 
     private enum RowKeyKind {
         OUTPUT_KEY,
@@ -96,7 +96,7 @@ final class GroupRows {
     private final RowData.FieldGetter[][] declaredKeyGetters;
     private final RowDataSerializer[] declaredKeySerializers;
 
-    GroupRows(GroupRefreshSpec spec, RuntimeContext runtimeContext) throws Exception {
+    public GroupRows(GroupRefreshSpec spec, RuntimeContext runtimeContext) throws Exception {
         this.joined = new LineRowData(spec.joinedTables, spec.joinedFields);
         this.outputSerializer = new RowDataSerializer(spec.outputType);
         this.rowKeyKind = rowKeyKind(spec);
@@ -146,7 +146,7 @@ final class GroupRows {
     }
 
     /** The type of the row keys, which tell the rows of a group apart. */
-    static RowType rowKeyType(GroupRefreshSpec spec) {
+    public static RowType rowKeyType(GroupRefreshSpec spec) {
         List<LogicalType> types = new ArrayList<>();
         switch (rowKeyKind(spec)) {
             case OUTPUT_KEY:
@@ -218,7 +218,7 @@ final class GroupRows {
      * Whether the row key of a row depends on its line only. Numbers among equal rows depend on the
      * whole group.
      */
-    boolean rowKeysDependOnLinesOnly() {
+    public boolean rowKeysDependOnLinesOnly() {
         return rowKeyKind != RowKeyKind.ROW_AND_OCCURRENCE;
     }
 
@@ -231,6 +231,20 @@ final class GroupRows {
             keys.add(rowKey(line, row, null));
         }
         return keys;
+    }
+
+    /**
+     * The emitted rows of one complete line, each with its row key in field 0 and the row in field
+     * 1. Row keys must depend on lines only.
+     */
+    public List<RowData[]> keyedRowsOf(RowData[] line) throws Exception {
+        Preconditions.checkState(rowKeysDependOnLinesOnly(), "Row keys depend on the group.");
+        List<BinaryRowData> rows = project(line);
+        List<RowData[]> keyed = new ArrayList<>(rows.size());
+        for (BinaryRowData row : rows) {
+            keyed.add(new RowData[] {rowKey(line, row, null), row});
+        }
+        return keyed;
     }
 
     /** The emitted rows of one line: none if the projection filters it out. */
